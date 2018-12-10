@@ -5,7 +5,7 @@ import tqdm
 import argparse
 import scipy.signal
 import time
-from spinup.utils.logx import Logger
+from spinup.utils.logx import EpochLogger
 
 EPS = 1E-8
 
@@ -42,9 +42,8 @@ class mlp_with_categorical:
             activation=tf.nn.tanh,
             output_activation=None)
         logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
-        pi = tf.squeeze(
-            tf.multinomial(logits, 1),
-            axis=1)  # batch_size x action_index, [n, 1]
+        pi = tf.squeeze(tf.multinomial(logits,
+                                       1))  # batch_size x action_index, [n, 1]
         logp_pi = tf.reduce_sum(
             tf.one_hot(pi, depth=self._action_dim) * logp_all,
             axis=1)  # log probability of policy action at current state
@@ -240,13 +239,17 @@ class vpg_buffer:
 
 
 def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
-        gamma, lamb, hid, buffer_size, batch_size, train_itr):
+        gamma, lamb, hid, buffer_size, batch_size, pi_train_itr, v_train_itr):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
     - On poliocy
     - suitable for discrete and continous action space
     """
+    # model saver
+    logger = EpochLogger()
+    logger.save_config(locals())
+
     act_dim = env.action_space.shape
     obs_dim = env.observation_space.shape
 
@@ -296,9 +299,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
     tf.logging.info('Number of trainable variables: pi {}, v {}'.format(
         num_pi, num_v))
 
-    # model saver
-    logger = Logger()
-
+    start_time = time.time()
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         logger.setup_tf_saver(
@@ -307,7 +308,6 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                 'v': v
             })
         for ep in range(epoch):
-            es_ret_all = []
             es_len = 0
             for es in range(episode):
                 ob = env.reset()  # initial state
@@ -330,7 +330,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                     if done or step == steps_per_episode - 1:
                         if done:
                             buffer.final(v=r_t)
-                            es_ret_all.append(es_ret)
+                            logger.store(EpRet=es_ret)
 
                         else:
                             buffer.final(
@@ -339,29 +339,29 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                         r_t = 0
                         es_ret = 0
             buffer.normalize_adv()
-            batch_tuple = buffer.sample(batch_size)
-            tf.logging.debug('buffer_sample_size: {}'.format(
-                batch_tuple[0].shape))
-
+            batch_tuple_all = buffer.sample(episode * steps_per_episode)
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
                 feed_dict={
-                    s: batch_tuple[0],
-                    a: batch_tuple[1],
-                    adv: batch_tuple[4],
-                    r_to_go: batch_tuple[2]
+                    s: batch_tuple_all[0],
+                    a: batch_tuple_all[1],
+                    adv: batch_tuple_all[4],
+                    r_to_go: batch_tuple_all[2]
                 })
             # Update policy
-            sess.run(
-                pi_opt,
-                feed_dict={
-                    s: batch_tuple[0],
-                    a: batch_tuple[1],
-                    adv: batch_tuple[4]
-                })
+            for _ in range(pi_train_itr):
+                batch_tuple = buffer.sample(batch_size)
+                sess.run(
+                    pi_opt,
+                    feed_dict={
+                        s: batch_tuple[0],
+                        a: batch_tuple[1],
+                        adv: batch_tuple[4]
+                    })
 
-            for i in range(train_itr):
+            for i in range(v_train_itr):
                 # Update value function
+                batch_tuple = buffer.sample(batch_size)
                 sess.run(
                     v_opt,
                     feed_dict={
@@ -372,11 +372,11 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
             pi_loss_new, v_loss_new, approx_kl_v, approx_entropy_v = sess.run(
                 [pi_loss, v_loss, approx_kl, approx_entropy],
                 feed_dict={
-                    s: batch_tuple[0],
-                    a: batch_tuple[1],
-                    adv: batch_tuple[4],
-                    r_to_go: batch_tuple[2],
-                    logp_old: batch_tuple[3]
+                    s: batch_tuple_all[0],
+                    a: batch_tuple_all[1],
+                    adv: batch_tuple_all[4],
+                    r_to_go: batch_tuple_all[2],
+                    logp_old: batch_tuple_all[3]
                 })
 
             # Save model
@@ -384,11 +384,24 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                 logger.save_state({'env': env})
 
             # Log
-            tf.logging.info('--------------------------')
-            tf.logging.info(
-                '\n epoch {} \n return {} \n policy loss old {} \n policy loss new {} \n value loss old {} \n value loss new {} \n KL {} \n Entropy {} \n'.
-                format(ep, np.mean(es_ret_all), pi_loss_old, pi_loss_new,
-                       v_loss_old, v_loss_new, approx_kl_v, approx_entropy_v))
+            logger.store(
+                LossPi=pi_loss_old,
+                LossV=v_loss_old,
+                DeltaLossPi=pi_loss_new - pi_loss_old,
+                DeltaLossV=v_loss_new - v_loss_old,
+                KL=approx_kl_v,
+                Entropy=approx_entropy_v)
+
+            logger.log_tabular('Epoch', ep)
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('LossPi', average_only=True)
+            logger.log_tabular('LossV', average_only=True)
+            logger.log_tabular('DeltaLossPi', average_only=True)
+            logger.log_tabular('DeltaLossV', average_only=True)
+            logger.log_tabular('Entropy', average_only=True)
+            logger.log_tabular('KL', average_only=True)
+            logger.log_tabular('Time', time.time() - start_time)
+            logger.dump_tabular()
 
 
 if __name__ == '__main__':
@@ -396,19 +409,20 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='CartPole-v1')
     parser.add_argument('--pi_lr', type=float, default=0.003)
     parser.add_argument('--v_lr', type=float, default=0.001)
-    parser.add_argument('--epoch', type=int, default=15)
+    parser.add_argument('--epoch', type=int, default=20)
     parser.add_argument('--episode', type=int, default=4)
     parser.add_argument('--steps_per_episode', type=int, default=1000)
     parser.add_argument('--hid', type=int, nargs='+', default=[64, 64])
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamb', type=float, default=0.97)
     parser.add_argument('--buffer_size', type=int, default=4200)
-    parser.add_argument('--batch_size', type=int, default=4000)
-    parser.add_argument('--train_itr', type=int, default=80)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--pi_train_itr', type=int, default=64)
+    parser.add_argument('--v_train_itr', type=int, default=80)
     args = parser.parse_args()
 
     env = gym.make(args.env)
 
     vpg(env, actor_critic, args.epoch, args.episode, args.steps_per_episode,
         args.pi_lr, args.v_lr, args.gamma, args.lamb, args.hid,
-        args.buffer_size, args.batch_size, args.train_itr)
+        args.buffer_size, args.batch_size, args.pi_train_itr, args.v_train_itr)
