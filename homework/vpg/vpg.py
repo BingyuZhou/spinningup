@@ -309,6 +309,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
             })
         for ep in range(epoch):
             es_len = 0
+            es_len_prev = 0
             for es in range(episode):
                 ob = env.reset()  # initial state
                 r_t = 0
@@ -330,7 +331,8 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                     if done or step == steps_per_episode - 1:
                         if done:
                             buffer.final(v=r_t)
-                            logger.store(EpRet=es_ret)
+                            logger.store(
+                                EpRet=es_ret, EpLen=es_len - es_len_prev)
 
                         else:
                             buffer.final(
@@ -338,6 +340,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                         ob = env.reset()
                         r_t = 0
                         es_ret = 0
+                        es_len_prev = es_len
             buffer.normalize_adv()
             batch_tuple_all = buffer.sample(episode * steps_per_episode)
             pi_loss_old, v_loss_old = sess.run(
@@ -393,6 +396,9 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                 Entropy=approx_entropy_v)
 
             logger.log_tabular('Epoch', ep)
+            logger.log_tabular('TotalEnvInteracts',
+                               (ep + 1) * episode * steps_per_episode)
+            logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('EpRet', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossV', average_only=True)
