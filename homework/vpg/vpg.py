@@ -5,10 +5,11 @@ import tqdm
 import argparse
 import scipy.signal
 import time
+from spinup.utils.logx import Logger
 
 EPS = 1E-8
 
-tf.logging.set_verbosity(tf.logging.DEBUG)
+tf.logging.set_verbosity(tf.logging.INFO)
 
 
 def log_p_gaussian(x, mu, logstd):
@@ -41,8 +42,9 @@ class mlp_with_categorical:
             activation=tf.nn.tanh,
             output_activation=None)
         logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
-        pi = tf.squeeze(tf.multinomial(logits,
-                                       1))  # batch_size x action_index, [n, 1]
+        pi = tf.squeeze(
+            tf.multinomial(logits, 1),
+            axis=1)  # batch_size x action_index, [n, 1]
         logp_pi = tf.reduce_sum(
             tf.one_hot(pi, depth=self._action_dim) * logp_all,
             axis=1)  # log probability of policy action at current state
@@ -293,8 +295,17 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
 
     tf.logging.info('Number of trainable variables: pi {}, v {}'.format(
         num_pi, num_v))
+
+    # model saver
+    logger = Logger()
+
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
+        logger.setup_tf_saver(
+            sess, inputs={'x': s}, outputs={
+                'pi': pi,
+                'v': v
+            })
         for ep in range(epoch):
             es_ret_all = []
             es_len = 0
@@ -368,6 +379,10 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                     logp_old: batch_tuple[3]
                 })
 
+            # Save model
+            if (ep % 10 == 0) or (ep == epoch - 1):
+                logger.save_state({'env': env})
+
             # Log
             tf.logging.info('--------------------------')
             tf.logging.info(
@@ -381,7 +396,7 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='CartPole-v1')
     parser.add_argument('--pi_lr', type=float, default=0.003)
     parser.add_argument('--v_lr', type=float, default=0.001)
-    parser.add_argument('--epoch', type=int, default=50)
+    parser.add_argument('--epoch', type=int, default=15)
     parser.add_argument('--episode', type=int, default=4)
     parser.add_argument('--steps_per_episode', type=int, default=1000)
     parser.add_argument('--hid', type=int, nargs='+', default=[64, 64])
