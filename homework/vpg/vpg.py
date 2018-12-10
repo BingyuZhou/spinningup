@@ -4,9 +4,11 @@ import gym
 import tqdm
 import argparse
 import scipy.signal
+import time
+
 EPS = 1E-8
 
-tf.logging.set_verbosity(tf.logging.INFO)
+tf.logging.set_verbosity(tf.logging.DEBUG)
 
 
 def log_p_gaussian(x, mu, logstd):
@@ -116,11 +118,11 @@ class vpg_buffer:
         self.buffer_size = buffer_size
         self.state_buffer = np.zeros(shape=(buffer_size, *obs_dim))
         self.action_buffer = np.zeros(shape=(buffer_size, *action_dim))
-        self.reward_buffer = np.zeros(shape=(buffer_size, 1))
-        self.value_buffer = np.zeros(shape=(buffer_size, 1))
-        self.logp_buffer = np.zeros(shape=(buffer_size, 1))
-        self.advantage_buffer = np.zeros(shape=(buffer_size, 1))
-        self.rewards_to_go_buffer = np.zeros(shape=(buffer_size, 1))
+        self.reward_buffer = np.zeros(shape=(buffer_size, ))
+        self.value_buffer = np.zeros(shape=(buffer_size, ))
+        self.logp_buffer = np.zeros(shape=(buffer_size, ))
+        self.advantage_buffer = np.zeros(shape=(buffer_size, ))
+        self.rewards_to_go_buffer = np.zeros(shape=(buffer_size, ))
         self.gamma = gamma
         self.lamb = lamb
         self.path_start_index = 0
@@ -134,7 +136,27 @@ class vpg_buffer:
         self.logp_buffer[step] = logp
         self.end_index = step
 
-    def final(self, v):
+    def cum_discounted_sum(self, x, discount):
+        """
+        Magic formula to compute cummunated sum of discounted value (Faster)
+        Input: x = [x1, x2, x3]
+        Output: x1+discount*x2+discount^2*x3, x2+discount*x3, x3
+        """
+        return scipy.signal.lfilter(
+            [1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+    def my_cum_discounted_sum(self, x, discount, size):
+        gamma_mat = np.zeros((size, size))
+        base = 1
+        np.fill_diagonal(gamma_mat, 1)
+        for i in range(1, size):
+            base = discount * base
+            np.fill_diagonal(gamma_mat[:, i:], base)
+        gamma_mat[0, -1] = base * discount
+
+        return np.dot(gamma_mat, x)
+
+    def final(self, v, my_cum_sum=False):
         """
         If the game is terminated, v = 0
         Else we use the value from the value function to bootstrap the rewards to go
@@ -147,44 +169,37 @@ class vpg_buffer:
         values = self.value_buffer[self.path_start_index:self.end_index + 2]
 
         # Compute rewards to go
-        # gamma_mat = np.zeros((self.end_index + 1 + 1, self.end_index + 1 + 1))
-        # base = 1
-        # np.fill_diagonal(gamma_mat, 1)
-        # for i in range(1, self.end_index + 1):
-        #     base = self.gamma * base
-        #     np.fill_diagonal(gamma_mat[:, i:], base)
-        # gamma_mat[0, -1] = base * self.gamma
-
-        # self.rewards_to_go = np.dot(gamma_mat,
-        #                             self.reward[:self.end_index + 1 + 1])
-        # self.rewards_to_go = self.rewards_to_go[:-1]
-
-        self.rewards_to_go_buffer[self.path_start_index:self.end_index +
-                                  1, :] = scipy.signal.lfilter(
-                                      [1], [1, float(-self.gamma)],
-                                      rewards[::-1],
-                                      axis=0)[::-1][:-1]
+        if my_cum_sum:
+            start = time.time()
+            self.rewards_to_go_buffer[self.path_start_index:self.end_index +
+                                      1] = self.my_cum_discounted_sum(
+                                          rewards, self.gamma,
+                                          rewards.shape[0])[:-1]
+            tf.logging.debug(
+                'time elasped for cum_discounted_sum:{}'.format(time.time() -
+                                                                start))
+        else:
+            start = time.time()
+            self.rewards_to_go_buffer[self.path_start_index:self.end_index +
+                                      1] = self.cum_discounted_sum(
+                                          rewards, self.gamma)[:-1]
+            tf.logging.debug(
+                'time elasped for cum_discounted_sum:{}'.format(time.time() -
+                                                                start))
 
         # Compute advantage (GAE)
         # A = sum (gamma * lambda)^t * TD
-        td_vec = rewards[:-1] + self.gamma * values[1:] - values[:-1]
+        td_vec = rewards[:-1, ] + self.gamma * values[1:, ] - values[:-1, ]
 
-        # gamma_lamb_matrix = np.zeros((self.end_index + 1, self.end_index + 1))
-        # base = 1
-        # np.fill_diagonal(gamma_lamb_matrix, 1)
-        # for i in range(1, self.end_index):
-        #     base = self.gamma * self.lamb * base
-        #     np.fill_diagonal(gamma_lamb_matrix[:, i:], base)
-        # gamma_lamb_matrix[0, -1] = base * self.gamma * self.lamb
-
-        # self.advantage = np.dot(gamma_lamb_matrix, td_vec)
-
-        self.advantage_buffer[self.path_start_index:self.end_index +
-                              1, :] = scipy.signal.lfilter(
-                                  [1], [1, float(-self.gamma * self.lamb)],
-                                  td_vec[::-1],
-                                  axis=0)[::-1]
-
+        if my_cum_sum:
+            self.advantage_buffer[self.path_start_index:self.end_index +
+                                  1] = self.my_cum_discounted_sum(
+                                      td_vec, self.gamma * self.lamb,
+                                      values.shape[0] - 1)
+        else:
+            self.advantage_buffer[self.path_start_index:self.end_index +
+                                  1] = self.cum_discounted_sum(
+                                      td_vec, self.gamma * self.lamb)
         # Start new trajectory
         self.path_start_index = self.end_index + 1
 
@@ -195,6 +210,10 @@ class vpg_buffer:
         self.advantage_buffer = (self.advantage_buffer - mu) / stdd
 
     def sample(self, size):
+
+        # Reset
+        self.path_start_index = 0
+
         if (size > self.end_index):
             tf.logging.warn(
                 'sample size is larger or equal than the buffer size, return all buffer'
@@ -250,10 +269,10 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
             s, a, env.action_space.n, hid, hid, policy_samp
         )  # In discrete space, teh last layer should be the number of possible actions
 
-    pi_loss = -tf.reduce_sum(
+    pi_loss = -tf.reduce_mean(
         logp * adv
     )  # should use logp, since we need the probability of the specific action sampled from buffer
-    v_loss = tf.reduce_sum((v - r_to_go)**2)
+    v_loss = tf.reduce_mean((v - r_to_go)**2)
 
     pi_opt = tf.train.AdamOptimizer(pi_lr).minimize(pi_loss)
     v_opt = tf.train.AdamOptimizer(v_lr).minimize(v_loss)
@@ -288,6 +307,11 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                     a_t, v_t, logp_t = sess.run(
                         [pi, v, logp_pi], feed_dict={s: ob.reshape(1, -1)})
                     buffer.add(ob, a_t, r_t, v_t, logp_t, es_len)
+                    # tf.logging.debug('state_buffer:{}'.format(ob))
+                    # tf.logging.debug('action_buffer:{}'.format(a_t))
+                    # tf.logging.debug('r:{}'.format(r_t))
+                    # tf.logging.debug('logp:{}'.format(logp_t))
+                    # tf.logging.debug('v:{}'.format(v_t))
                     ob, r_t, done, _ = env.step(a_t)
                     es_ret += r_t
                     es_len += 1
@@ -305,6 +329,8 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
                         es_ret = 0
             buffer.normalize_adv()
             batch_tuple = buffer.sample(batch_size)
+            tf.logging.debug('buffer_sample_size: {}'.format(
+                batch_tuple[0].shape))
 
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
@@ -353,7 +379,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='arguments for vpg')
     parser.add_argument('--env', type=str, default='CartPole-v1')
-    parser.add_argument('--pi_lr', type=float, default=0.0003)
+    parser.add_argument('--pi_lr', type=float, default=0.003)
     parser.add_argument('--v_lr', type=float, default=0.001)
     parser.add_argument('--epoch', type=int, default=50)
     parser.add_argument('--episode', type=int, default=4)
