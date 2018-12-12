@@ -143,8 +143,9 @@ class vpg_buffer:
         Input: x = [x1, x2, x3]
         Output: x1+discount*x2+discount^2*x3, x2+discount*x3, x3
         """
-        return scipy.signal.lfilter(
-            [1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+        return scipy.signal.lfilter([1], [1, float(-discount)],
+                                    x[::-1],
+                                    axis=0)[::-1]
 
     def my_cum_discounted_sum(self, x, discount, size):
         gamma_mat = np.zeros((size, size))
@@ -238,8 +239,9 @@ class vpg_buffer:
             ]
 
 
-def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
-        gamma, lamb, hid, buffer_size, batch_size, pi_train_itr, v_train_itr):
+def vpg(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
+        v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
+        v_train_itr):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -249,6 +251,10 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
     # model saver
     logger = EpochLogger()
     logger.save_config(locals())
+
+    seed += 10000
+    tf.set_random_seed(seed)
+    np.random.seed(seed)
 
     act_dim = env.action_space.shape
     obs_dim = env.observation_space.shape
@@ -354,6 +360,7 @@ def vpg(env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr, v_lr,
             # Update policy
             for _ in range(pi_train_itr):
                 batch_tuple = buffer.sample(batch_size)
+                assert batch_tuple[0].shape[0] == batch_size
                 sess.run(
                     pi_opt,
                     feed_dict={
@@ -415,7 +422,7 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='CartPole-v1')
     parser.add_argument('--pi_lr', type=float, default=0.003)
     parser.add_argument('--v_lr', type=float, default=0.001)
-    parser.add_argument('--epoch', type=int, default=20)
+    parser.add_argument('--epoch', type=int, default=50)
     parser.add_argument('--episode', type=int, default=4)
     parser.add_argument('--steps_per_episode', type=int, default=1000)
     parser.add_argument('--hid', type=int, nargs='+', default=[64, 64])
@@ -423,12 +430,12 @@ if __name__ == '__main__':
     parser.add_argument('--lamb', type=float, default=0.97)
     parser.add_argument('--buffer_size', type=int, default=4200)
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--pi_train_itr', type=int, default=64)
-    parser.add_argument('--v_train_itr', type=int, default=80)
+    parser.add_argument('--pi_train_itr', type=int, default=32)
+    parser.add_argument('--v_train_itr', type=int, default=32)
     args = parser.parse_args()
 
     env = gym.make(args.env)
 
-    vpg(env, actor_critic, args.epoch, args.episode, args.steps_per_episode,
+    vpg(0, env, actor_critic, args.epoch, args.episode, args.steps_per_episode,
         args.pi_lr, args.v_lr, args.gamma, args.lamb, args.hid,
         args.buffer_size, args.batch_size, args.pi_train_itr, args.v_train_itr)
