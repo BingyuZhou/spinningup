@@ -34,6 +34,9 @@ class mlp_with_categorical:
         self._hid = policy_hid
         self._action_dim = action_dim
 
+    def kl(self, logp, logq):
+        return tf.reduce_sum(tf.exp(logp)*(logp-logq), axis=1)
+
     def run(self, s, a):
         logits = mlp(
             s,
@@ -42,15 +45,17 @@ class mlp_with_categorical:
             activation=tf.nn.tanh,
             output_activation=None)
         logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
-        pi = tf.squeeze(tf.multinomial(logits,
-                                       1))  # batch_size x action_index, [n, 1]
+        # batch_size x action_index, [n, 1]
+        pi = tf.squeeze(tf.multinomial(logits, 1))
         logp_pi = tf.reduce_sum(
             tf.one_hot(pi, depth=self._action_dim) * logp_all,
             axis=1)  # log probability of policy action at current state
         logp = tf.reduce_sum(
             tf.one_hot(a, depth=self._action_dim) * logp_all,
             axis=1)  # log probability of action a at current state
-        return pi, logp, logp_pi
+        pi_dist_old = tf.placeholder(dtype=tf.float32, shape=(None,))
+        d_kl = self.kl(logp_all, pi_dist_old)
+        return pi, logp, logp_pi, logp_all, d_kl
 
 
 class mlp_with_diagonal_gaussian:
@@ -65,6 +70,15 @@ class mlp_with_diagonal_gaussian:
             'log_std',
             initializer=-0.5 * np.ones(action_dim, dtype=tf.float32))
 
+    def kl(self, mu_0, logstd_0, p_1):
+        """ KL divergence 0 over 1"""
+        var_0 = tf.exp(logstd_0)**2
+        mu_1 = p_1[:, 0]
+        logstd_1 = p_1[:, -1]
+        var_1 = tf.exp(logstd_1)**2
+
+        return tf.reduce_sum((0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1)) + logstd_0 - logstd_1)
+
     def run(self, s, a):
         mu = mlp(
             s,
@@ -76,7 +90,9 @@ class mlp_with_diagonal_gaussian:
         pi = tf.random_normal(tf.shape(mu)) * std + mu
         logp = log_p_gaussian(a, mu, self.logstd)
         logp_pi = log_p_gaussian(pi, mu, self.logstd)
-        return pi, logp, logp_pi
+        pi_dist_old = tf.placeholder(dtype=tf.float32, shape=(None, 2))
+        d_kl = self.kl(mu, std, pi_dist_old)
+        return pi, logp, logp_pi, [mu, self.logstd], d_kl
 
 
 class mlp_with_diagonal_gaussian_on_state:
@@ -100,22 +116,22 @@ def actor_critic(s,
         else:
             actor = mlp_with_diagonal_gaussian(policy_hid, action_dim)
 
-        pi, logp, logp_pi = actor.run(s, a)
+        pi, logp, logp_pi, pi_dist, d_kl = actor.run(s, a)
 
     with tf.variable_scope('v'):
         v = mlp(s, value_hid, 1, activation=tf.nn.tanh, output_activation=None)
 
-    return pi, logp, logp_pi, v
+    return pi, logp, logp_pi, pi_dist, d_kl, v
 
 
-class vpg_buffer:
+class trpo_buffer:
     """
     Replay Buffer (On policy)
     - Only contain the transitions from the current policy
     - overwritten when a new policy is applied
     """
 
-    def __init__(self, buffer_size, obs_dim, action_dim, gamma, lamb):
+    def __init__(self, buffer_size, obs_dim, action_dim, gamma, lamb, policy_sample):
         self.buffer_size = buffer_size
         self.state_buffer = np.zeros(shape=(buffer_size, *obs_dim))
         self.action_buffer = np.zeros(shape=(buffer_size, *action_dim))
@@ -124,17 +140,23 @@ class vpg_buffer:
         self.logp_buffer = np.zeros(shape=(buffer_size, ))
         self.advantage_buffer = np.zeros(shape=(buffer_size, ))
         self.rewards_to_go_buffer = np.zeros(shape=(buffer_size, ))
+        # policy distribution used for KL
+        if policy_sample == 'categorical':
+            self.pidist_buffer = np.zeros(shape=(buffer_size,))
+        else:
+            self.pidist_buffer = np.zeros(shape=(buffer_size, 2))  # mu, logstd
         self.gamma = gamma
         self.lamb = lamb
         self.path_start_index = 0
 
-    def add(self, s, a, r, v, logp, step):
+    def add(self, s, a, r, v, logp, pi_dist, step):
         assert step < self.buffer_size
         self.state_buffer[step] = s
         self.action_buffer[step] = a
         self.reward_buffer[step] = r
         self.value_buffer[step] = v
         self.logp_buffer[step] = logp
+        self.pidist_buffer[step] = pi_dist
         self.end_index = step
 
     def cum_discounted_sum(self, x, discount):
@@ -224,7 +246,8 @@ class vpg_buffer:
                 self.action_buffer[:self.end_index + 1],
                 self.rewards_to_go_buffer[:self.end_index + 1],
                 self.logp_buffer[:self.end_index + 1],
-                self.advantage_buffer[:self.end_index + 1]
+                self.advantage_buffer[:self.end_index + 1],
+                self.pidist_buffer[:self.end_index+1]
             ]
         else:
             sample_index = np.random.choice(
@@ -234,13 +257,14 @@ class vpg_buffer:
                 self.action_buffer[sample_index],
                 self.rewards_to_go_buffer[sample_index],
                 self.logp_buffer[sample_index],
-                self.advantage_buffer[sample_index]
+                self.advantage_buffer[sample_index],
+                self.pidist_buffer[sample_index]
             ]
 
 
-def vpg(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
-        v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-        v_train_itr):
+def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
+         v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
+         v_train_itr):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -258,37 +282,37 @@ def vpg(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     act_dim = env.action_space.shape
     obs_dim = env.observation_space.shape
 
-    buffer = vpg_buffer(buffer_size, obs_dim, act_dim, gamma, lamb)
-
     s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name='obs')
 
     adv = tf.placeholder(dtype=tf.float32, shape=None, name='advantage')
     r_to_go = tf.placeholder(
         dtype=tf.float32, shape=None, name='rewards_to_go')
+    logp_old = tf.placeholder(dtype=tf.float32, shape=None)
+
     if isinstance(env.action_space, gym.spaces.Box):
         policy_samp = 'diagnoal_gaussian'
         a = tf.placeholder(
             dtype=tf.float32, shape=(None, *act_dim), name='action')
-        pi, logp, logp_pi, v = actor_critic_fn(s, a, act_dim, hid, hid,
-                                               policy_samp)
+        pi, logp, logp_pi, pi_dist, d_kl, v = actor_critic_fn(s, a, act_dim, hid, hid,
+                                                              policy_samp)
     elif isinstance(env.action_space, gym.spaces.Discrete):
         policy_samp = 'categorical'
         a = tf.placeholder(
             dtype=tf.int32, shape=(None, *act_dim), name='action')
-        pi, logp, logp_pi, v = actor_critic_fn(
+        pi, logp, logp_pi, pi_dist, d_kl, v = actor_critic_fn(
             s, a, env.action_space.n, hid, hid, policy_samp
         )  # In discrete space, teh last layer should be the number of possible actions
 
+    buffer = trpo_buffer(buffer_size, obs_dim, act_dim,
+                         gamma, lamb, policy_samp)
+
     pi_loss = -tf.reduce_mean(
-        logp * adv
+        tf.exp(logp-logp_old) * adv
     )  # should use logp, since we need the probability of the specific action sampled from buffer
     v_loss = tf.reduce_mean((v - r_to_go)**2)
 
-    pi_opt = tf.train.AdamOptimizer(pi_lr).minimize(pi_loss)
     v_opt = tf.train.AdamOptimizer(v_lr).minimize(v_loss)
 
-    logp_old = tf.placeholder(dtype=tf.float32, shape=None)
-    approx_kl = tf.reduce_mean(logp_old - logp)
     approx_entropy = tf.reduce_mean(-logp)
 
     # Number of variables
@@ -435,6 +459,7 @@ if __name__ == '__main__':
 
     env = gym.make(args.env)
 
-    vpg(0, env, actor_critic, args.epoch, args.episode, args.steps_per_episode,
-        args.pi_lr, args.v_lr, args.gamma, args.lamb, args.hid,
-        args.buffer_size, args.batch_size, args.pi_train_itr, args.v_train_itr)
+    trpo(0, env, actor_critic, args.epoch, args.episode,
+         args.steps_per_episode, args.pi_lr, args.v_lr, args.gamma, args.lamb,
+         args.hid, args.buffer_size, args.batch_size, args.pi_train_itr,
+         args.v_train_itr)
