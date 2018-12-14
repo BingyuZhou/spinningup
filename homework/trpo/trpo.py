@@ -264,7 +264,7 @@ class trpo_buffer:
 
 def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
          v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-         v_train_itr):
+         v_train_itr, cg_itr):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -306,16 +306,29 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     buffer = trpo_buffer(buffer_size, obs_dim, act_dim,
                          gamma, lamb, policy_samp)
 
-    pi_loss = -tf.reduce_mean(
-        tf.exp(logp-logp_old) * adv
-    )  # should use logp, since we need the probability of the specific action sampled from buffer
+    # should use logp, since we need the probability of the specific action sampled from buffer
+    pi_loss = -tf.reduce_mean(tf.exp(logp-logp_old) * adv)
     v_loss = tf.reduce_mean((v - r_to_go)**2)
 
     v_opt = tf.train.AdamOptimizer(v_lr).minimize(v_loss)
 
     approx_entropy = tf.reduce_mean(-logp)
 
-    # Number of variables
+    # Core of TRPO
+    def conjugate_grad(Hx, g):
+        """
+        Conjugate gradient method
+        Given Hx = g, return x
+        start with initial guess x0 = 0
+        """
+        x = np.zeros_like(g)
+        r = g.copy()
+        p = g.copy()
+        rr = np.dot(r, r)
+        for _ in range(cg_itr):
+            alpha = rr/np.dot(p, Hx(p))
+
+            # Number of variables
     var_pi = tf.trainable_variables(scope='pi')
     var_v = tf.trainable_variables(scope='v')
     num_pi = 0
