@@ -35,16 +35,18 @@ class mlp_with_categorical:
         self._action_dim = action_dim
 
     def kl(self, logp, logq):
-        return tf.reduce_sum(tf.exp(logp)*(logp-logq), axis=1)
+        # D_kl(param||param_old)
+        return tf.reduce_mean(tf.reduce_sum(tf.exp(logp)*(logp-logq), axis=1))
 
-    def run(self, s, a):
+    def run(self, s, a, pi_dist_old):
         logits = mlp(
             s,
             self._hid,
             self._action_dim,
             activation=tf.nn.tanh,
             output_activation=None)
-        logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
+        # batch_size x action_dim, [n ,m]
+        logp_all = tf.nn.log_softmax(logits)
         # batch_size x action_index, [n, 1]
         pi = tf.squeeze(tf.multinomial(logits, 1))
         logp_pi = tf.reduce_sum(
@@ -53,7 +55,7 @@ class mlp_with_categorical:
         logp = tf.reduce_sum(
             tf.one_hot(a, depth=self._action_dim) * logp_all,
             axis=1)  # log probability of action a at current state
-        pi_dist_old = tf.placeholder(dtype=tf.float32, shape=(None,))
+
         d_kl = self.kl(logp_all, pi_dist_old)
         return pi, logp, logp_pi, logp_all, d_kl
 
@@ -77,9 +79,9 @@ class mlp_with_diagonal_gaussian:
         logstd_1 = p_1[:, -1]
         var_1 = tf.exp(logstd_1)**2
 
-        return tf.reduce_sum((0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1)) + logstd_0 - logstd_1)
+        return tf.reduce_mean(tf.reduce_sum((0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1)) + logstd_0 - logstd_1))
 
-    def run(self, s, a):
+    def run(self, s, a, pi_dist_old):
         mu = mlp(
             s,
             self._hid,
@@ -90,7 +92,7 @@ class mlp_with_diagonal_gaussian:
         pi = tf.random_normal(tf.shape(mu)) * std + mu
         logp = log_p_gaussian(a, mu, self.logstd)
         logp_pi = log_p_gaussian(pi, mu, self.logstd)
-        pi_dist_old = tf.placeholder(dtype=tf.float32, shape=(None, 2))
+
         d_kl = self.kl(mu, std, pi_dist_old)
         return pi, logp, logp_pi, [mu, self.logstd], d_kl
 
@@ -102,6 +104,7 @@ class mlp_with_diagonal_gaussian_on_state:
 def actor_critic(s,
                  a,
                  action_dim,
+                 pi_dist_old,
                  policy_hid=[64, 64],
                  value_hid=[64],
                  policy_samp='categorical'):
@@ -116,7 +119,7 @@ def actor_critic(s,
         else:
             actor = mlp_with_diagonal_gaussian(policy_hid, action_dim)
 
-        pi, logp, logp_pi, pi_dist, d_kl = actor.run(s, a)
+        pi, logp, logp_pi, pi_dist, d_kl = actor.run(s, a, pi_dist_old)
 
     with tf.variable_scope('v'):
         v = mlp(s, value_hid, 1, activation=tf.nn.tanh, output_activation=None)
@@ -131,7 +134,7 @@ class trpo_buffer:
     - overwritten when a new policy is applied
     """
 
-    def __init__(self, buffer_size, obs_dim, action_dim, gamma, lamb, policy_sample):
+    def __init__(self, buffer_size, obs_dim, action_dim, act_space, gamma, lamb, policy_sample):
         self.buffer_size = buffer_size
         self.state_buffer = np.zeros(shape=(buffer_size, *obs_dim))
         self.action_buffer = np.zeros(shape=(buffer_size, *action_dim))
@@ -142,7 +145,7 @@ class trpo_buffer:
         self.rewards_to_go_buffer = np.zeros(shape=(buffer_size, ))
         # policy distribution used for KL
         if policy_sample == 'categorical':
-            self.pidist_buffer = np.zeros(shape=(buffer_size,))
+            self.pidist_buffer = np.zeros(shape=(buffer_size, act_space))
         else:
             self.pidist_buffer = np.zeros(shape=(buffer_size, 2))  # mu, logstd
         self.gamma = gamma
@@ -264,7 +267,7 @@ class trpo_buffer:
 
 def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
          v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-         v_train_itr, cg_itr):
+         v_train_itr, cg_itr, delta):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -288,22 +291,23 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     r_to_go = tf.placeholder(
         dtype=tf.float32, shape=None, name='rewards_to_go')
     logp_old = tf.placeholder(dtype=tf.float32, shape=None)
+    pi_dist_old = tf.placeholder(dtype=tf.float32, shape=(None, None))
 
     if isinstance(env.action_space, gym.spaces.Box):
         policy_samp = 'diagnoal_gaussian'
         a = tf.placeholder(
             dtype=tf.float32, shape=(None, *act_dim), name='action')
-        pi, logp, logp_pi, pi_dist, d_kl, v = actor_critic_fn(s, a, act_dim, hid, hid,
+        pi, logp, logp_pi, pi_dist, d_kl, v = actor_critic_fn(s, a, act_dim, pi_dist_old, hid, hid,
                                                               policy_samp)
     elif isinstance(env.action_space, gym.spaces.Discrete):
         policy_samp = 'categorical'
         a = tf.placeholder(
             dtype=tf.int32, shape=(None, *act_dim), name='action')
+        # In discrete space, teh last layer should be the number of possible actions
         pi, logp, logp_pi, pi_dist, d_kl, v = actor_critic_fn(
-            s, a, env.action_space.n, hid, hid, policy_samp
-        )  # In discrete space, teh last layer should be the number of possible actions
+            s, a, env.action_space.n, pi_dist_old, hid, hid, policy_samp)
 
-    buffer = trpo_buffer(buffer_size, obs_dim, act_dim,
+    buffer = trpo_buffer(buffer_size, obs_dim, act_dim, env.action_space.n,
                          gamma, lamb, policy_samp)
 
     # should use logp, since we need the probability of the specific action sampled from buffer
@@ -321,14 +325,21 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
         Given Hx = g, return x
         start with initial guess x0 = 0
         """
+
         x = np.zeros_like(g)
         r = g.copy()
         p = g.copy()
         rr = np.dot(r, r)
         for _ in range(cg_itr):
+            assert Hx(p).shape[0] == g.shape[0]
             alpha = rr/np.dot(p, Hx(p))
+            x += alpha*p
+            r -= alpha*Hx(p)
+            beta = np.dot(r, r)/rr
+            p = r+beta*p
+        return x
 
-            # Number of variables
+    # Number of variables
     var_pi = tf.trainable_variables(scope='pi')
     var_v = tf.trainable_variables(scope='v')
     num_pi = 0
@@ -340,9 +351,21 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
 
     tf.logging.info('Number of trainable variables: pi {}, v {}'.format(
         num_pi, num_v))
+    # Gradient of loss
+    grad_pi = tf.concat(values=[tf.reshape(x, [-1, ])
+                                for x in tf.gradients(ys=pi_loss, xs=var_pi)], axis=0)
+    # Hessian matrix of constraint (Do not compute hessain directly for the sake of memory)
+    # lists of gradients [kl/W1, kl/b1, kl/W2, kl/b2, kl/out, kl/out_bias]
+    grad_cons = tf.concat(values=[tf.reshape(x, [-1, ])
+                                  for x in tf.gradients(ys=d_kl, xs=var_pi)], axis=0)
+    v_ph = tf.placeholder(dtype=tf.float32, shape=grad_cons.shape)
+    hx = tf.concat(values=[tf.reshape(x, [-1, ])for x in tf.gradients(
+        ys=tf.reduce_sum(grad_cons*v_ph), xs=var_pi)], axis=0)
 
+    all_phs = [s, a, r_to_go, logp_old, adv, pi_dist_old]
     start_time = time.time()
     with tf.Session() as sess:
+
         sess.run(tf.global_variables_initializer())
         logger.setup_tf_saver(
             sess, inputs={'x': s}, outputs={
@@ -358,9 +381,9 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                 es_ret = 0
 
                 for step in range(steps_per_episode):
-                    a_t, v_t, logp_t = sess.run(
-                        [pi, v, logp_pi], feed_dict={s: ob.reshape(1, -1)})
-                    buffer.add(ob, a_t, r_t, v_t, logp_t, es_len)
+                    a_t, v_t, logp_t, pi_dist_t = sess.run(
+                        [pi, v, logp_pi, pi_dist], feed_dict={s: ob.reshape(1, -1)})
+                    buffer.add(ob, a_t, r_t, v_t, logp_t, pi_dist_t[0], es_len)
                     # tf.logging.debug('state_buffer:{}'.format(ob))
                     # tf.logging.debug('action_buffer:{}'.format(a_t))
                     # tf.logging.debug('r:{}'.format(r_t))
@@ -391,19 +414,24 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                     s: batch_tuple_all[0],
                     a: batch_tuple_all[1],
                     adv: batch_tuple_all[4],
-                    r_to_go: batch_tuple_all[2]
+                    r_to_go: batch_tuple_all[2],
+                    logp_old: batch_tuple_all[3]
                 })
-            # Update policy
+
             for _ in range(pi_train_itr):
+                # Update policy
                 batch_tuple = buffer.sample(batch_size)
+                inputs = {k: v for k, v in zip(all_phs, batch_tuple)}
+
+                def Hx(x): return sess.run(hx, feed_dict={v_ph: x, **inputs})
+                x = conjugate_grad(Hx, sess.run(grad_pi, feed_dict={
+                    s: batch_tuple[0], a: batch_tuple[1], adv: batch_tuple[4], r_to_go: batch_tuple[2], logp_old: batch_tuple[3]}))
+
+                update_params = tf.group(tf.assign(p, p_new)for p, p_new in zip(
+                    var_pi, var_pi-np.sqrt(2*delta/(np.dot(grad_pi, x))*x)))
+                sess.run(update_params)
+
                 assert batch_tuple[0].shape[0] == batch_size
-                sess.run(
-                    pi_opt,
-                    feed_dict={
-                        s: batch_tuple[0],
-                        a: batch_tuple[1],
-                        adv: batch_tuple[4]
-                    })
 
             for i in range(v_train_itr):
                 # Update value function
@@ -415,8 +443,8 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                         s: batch_tuple[0]
                     })
 
-            pi_loss_new, v_loss_new, approx_kl_v, approx_entropy_v = sess.run(
-                [pi_loss, v_loss, approx_kl, approx_entropy],
+            pi_loss_new, v_loss_new, approx_entropy_v = sess.run(
+                [pi_loss, v_loss, approx_entropy],
                 feed_dict={
                     s: batch_tuple_all[0],
                     a: batch_tuple_all[1],
@@ -435,7 +463,6 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                 LossV=v_loss_old,
                 DeltaLossPi=pi_loss_new - pi_loss_old,
                 DeltaLossV=v_loss_new - v_loss_old,
-                KL=approx_kl_v,
                 Entropy=approx_entropy_v)
 
             logger.log_tabular('Epoch', ep)
@@ -448,7 +475,6 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
             logger.log_tabular('DeltaLossPi', average_only=True)
             logger.log_tabular('DeltaLossV', average_only=True)
             logger.log_tabular('Entropy', average_only=True)
-            logger.log_tabular('KL', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
 
@@ -468,6 +494,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--pi_train_itr', type=int, default=5)
     parser.add_argument('--v_train_itr', type=int, default=64)
+    # more iterations, more accurate calculation of inv(H)g, slower training
+    parser.add_argument('--cg_itr', type=int, default=10)
+    # should ne small for stability
+    parser.add_argument('--delta', type=int, default=0.01)
     args = parser.parse_args()
 
     env = gym.make(args.env)
@@ -475,4 +505,4 @@ if __name__ == '__main__':
     trpo(0, env, actor_critic, args.epoch, args.episode,
          args.steps_per_episode, args.pi_lr, args.v_lr, args.gamma, args.lamb,
          args.hid, args.buffer_size, args.batch_size, args.pi_train_itr,
-         args.v_train_itr)
+         args.v_train_itr, args.cg_itr, args.delta)
