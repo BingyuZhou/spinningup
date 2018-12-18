@@ -339,8 +339,6 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
             beta = rr_new/rr
             p = r+beta*p
             rr = rr_new
-            print(i)
-            print(x)
         return x
 
     # Number of variables
@@ -414,6 +412,7 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                         es_len_prev = es_len
             buffer.normalize_adv()
             batch_tuple_all = buffer.sample(episode * steps_per_episode)
+            inputs = {k: v for k, v in zip(all_phs, batch_tuple_all)}
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
                 feed_dict={
@@ -426,10 +425,8 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
 
             # Update policy
 
-            def Hx(x): return sess.run(hx, feed_dict={v_ph: x, s: batch_tuple_all[0], a: batch_tuple_all[1], adv: batch_tuple_all[
-                4], r_to_go: batch_tuple_all[2], logp_old: batch_tuple_all[3], pi_dist_old: batch_tuple_all[5]})
-            x = conjugate_grad(Hx, sess.run(grad_pi, feed_dict={
-                               s: batch_tuple_all[0], a: batch_tuple_all[1], adv: batch_tuple_all[4], r_to_go: batch_tuple_all[2], logp_old: batch_tuple_all[3]}))
+            def Hx(x): return sess.run(hx, feed_dict={v_ph: x, **inputs})
+            x = conjugate_grad(Hx, sess.run(grad_pi, feed_dict={**inputs}))
 
             var_pi_flat = tf.concat(
                 values=[tf.reshape(x, [-1, ]) for x in var_pi], axis=0)
@@ -447,7 +444,7 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
 
             sess.run(tf.group(params_assign))
 
-            for i in range(v_train_itr):
+            for _ in range(v_train_itr):
                 # Update value function
                 batch_tuple = buffer.sample(batch_size)
                 sess.run(
@@ -457,15 +454,8 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                         s: batch_tuple[0]
                     })
 
-            pi_loss_new, v_loss_new, approx_entropy_v = sess.run(
-                [pi_loss, v_loss, approx_entropy],
-                feed_dict={
-                    s: batch_tuple_all[0],
-                    a: batch_tuple_all[1],
-                    adv: batch_tuple_all[4],
-                    r_to_go: batch_tuple_all[2],
-                    logp_old: batch_tuple_all[3]
-                })
+            pi_loss_new, v_loss_new, approx_entropy_v, kl = sess.run(
+                [pi_loss, v_loss, approx_entropy, d_kl], feed_dict=inputs)
 
             # Save model
             if (ep % 10 == 0) or (ep == epoch - 1):
@@ -477,7 +467,8 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                 LossV=v_loss_old,
                 DeltaLossPi=pi_loss_new - pi_loss_old,
                 DeltaLossV=v_loss_new - v_loss_old,
-                Entropy=approx_entropy_v)
+                Entropy=approx_entropy_v,
+                KL=kl)
 
             logger.log_tabular('Epoch', ep)
             logger.log_tabular('TotalEnvInteracts',
@@ -489,6 +480,7 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
             logger.log_tabular('DeltaLossPi', average_only=True)
             logger.log_tabular('DeltaLossV', average_only=True)
             logger.log_tabular('Entropy', average_only=True)
+            logger.log_tabular('KL', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
 
@@ -505,11 +497,11 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamb', type=float, default=0.97)
     parser.add_argument('--buffer_size', type=int, default=4200)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--pi_train_itr', type=int, default=5)
     parser.add_argument('--v_train_itr', type=int, default=64)
     # more iterations, more accurate calculation of inv(H)g, slower training
-    parser.add_argument('--cg_itr', type=int, default=15)
+    parser.add_argument('--cg_itr', type=int, default=10)
     # should ne small for stability
     parser.add_argument('--delta', type=float, default=0.01)
     parser.add_argument('--damping_ratio', type=float, default=0.1)
