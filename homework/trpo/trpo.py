@@ -267,7 +267,7 @@ class trpo_buffer:
 
 def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
          v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-         v_train_itr, cg_itr, delta):
+         v_train_itr, cg_itr, delta, damping_ratio):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -330,13 +330,17 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
         r = g.copy()
         p = g.copy()
         rr = np.dot(r, r)
-        for _ in range(cg_itr):
-            assert Hx(p).shape[0] == g.shape[0]
-            alpha = rr/np.dot(p, Hx(p))
+        for i in range(cg_itr):
+            z = Hx(p)
+            alpha = rr / (np.dot(p, z)+EPS)
             x += alpha*p
-            r -= alpha*Hx(p)
-            beta = np.dot(r, r)/rr
+            r -= alpha*z
+            rr_new = np.dot(r, r)
+            beta = rr_new/rr
             p = r+beta*p
+            rr = rr_new
+            print(i)
+            print(x)
         return x
 
     # Number of variables
@@ -352,15 +356,17 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     tf.logging.info('Number of trainable variables: pi {}, v {}'.format(
         num_pi, num_v))
     # Gradient of loss
-    grad_pi = tf.concat(values=[tf.reshape(x, [-1, ])
+    grad_pi = tf.concat(values=[tf.reshape(x, (-1, ))
                                 for x in tf.gradients(ys=pi_loss, xs=var_pi)], axis=0)
     # Hessian matrix of constraint (Do not compute hessain directly for the sake of memory)
     # lists of gradients [kl/W1, kl/b1, kl/W2, kl/b2, kl/out, kl/out_bias]
-    grad_cons = tf.concat(values=[tf.reshape(x, [-1, ])
+    grad_cons = tf.concat(values=[tf.reshape(x, (-1, ))
                                   for x in tf.gradients(ys=d_kl, xs=var_pi)], axis=0)
     v_ph = tf.placeholder(dtype=tf.float32, shape=grad_cons.shape)
-    hx = tf.concat(values=[tf.reshape(x, [-1, ])for x in tf.gradients(
+    hx = tf.concat(values=[tf.reshape(x, (-1, )) for x in tf.gradients(
         ys=tf.reduce_sum(grad_cons*v_ph), xs=var_pi)], axis=0)
+    if damping_ratio > 0:
+        hx += damping_ratio*v_ph
 
     all_phs = [s, a, r_to_go, logp_old, adv, pi_dist_old]
     start_time = time.time()
@@ -418,20 +424,28 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                     logp_old: batch_tuple_all[3]
                 })
 
-            for _ in range(pi_train_itr):
-                # Update policy
-                batch_tuple = buffer.sample(batch_size)
-                inputs = {k: v for k, v in zip(all_phs, batch_tuple)}
+            # Update policy
 
-                def Hx(x): return sess.run(hx, feed_dict={v_ph: x, **inputs})
-                x = conjugate_grad(Hx, sess.run(grad_pi, feed_dict={
-                    s: batch_tuple[0], a: batch_tuple[1], adv: batch_tuple[4], r_to_go: batch_tuple[2], logp_old: batch_tuple[3]}))
+            def Hx(x): return sess.run(hx, feed_dict={v_ph: x, s: batch_tuple_all[0], a: batch_tuple_all[1], adv: batch_tuple_all[
+                4], r_to_go: batch_tuple_all[2], logp_old: batch_tuple_all[3], pi_dist_old: batch_tuple_all[5]})
+            x = conjugate_grad(Hx, sess.run(grad_pi, feed_dict={
+                               s: batch_tuple_all[0], a: batch_tuple_all[1], adv: batch_tuple_all[4], r_to_go: batch_tuple_all[2], logp_old: batch_tuple_all[3]}))
 
-                update_params = tf.group(tf.assign(p, p_new)for p, p_new in zip(
-                    var_pi, var_pi-np.sqrt(2*delta/(np.dot(grad_pi, x))*x)))
-                sess.run(update_params)
+            var_pi_flat = tf.concat(
+                values=[tf.reshape(x, [-1, ]) for x in var_pi], axis=0)
+            assert (2*delta/(np.dot(Hx(x), x)+EPS)) >= 0
+            param_new_flat = var_pi_flat - \
+                np.sqrt(2*delta/(np.dot(Hx(x), x)+EPS))*x
 
-                assert batch_tuple[0].shape[0] == batch_size
+            def param_size(p):
+                return int(np.prod(p.shape))
+
+            param_new_splits = tf.split(
+                param_new_flat, [param_size(x) for x in var_pi])
+            params_assign = [tf.assign(p, tf.reshape(
+                p_new, p.shape)) for p, p_new in zip(var_pi, param_new_splits)]
+
+            sess.run(tf.group(params_assign))
 
             for i in range(v_train_itr):
                 # Update value function
@@ -495,9 +509,10 @@ if __name__ == '__main__':
     parser.add_argument('--pi_train_itr', type=int, default=5)
     parser.add_argument('--v_train_itr', type=int, default=64)
     # more iterations, more accurate calculation of inv(H)g, slower training
-    parser.add_argument('--cg_itr', type=int, default=10)
+    parser.add_argument('--cg_itr', type=int, default=15)
     # should ne small for stability
-    parser.add_argument('--delta', type=int, default=0.01)
+    parser.add_argument('--delta', type=float, default=0.01)
+    parser.add_argument('--damping_ratio', type=float, default=0.1)
     args = parser.parse_args()
 
     env = gym.make(args.env)
@@ -505,4 +520,4 @@ if __name__ == '__main__':
     trpo(0, env, actor_critic, args.epoch, args.episode,
          args.steps_per_episode, args.pi_lr, args.v_lr, args.gamma, args.lamb,
          args.hid, args.buffer_size, args.batch_size, args.pi_train_itr,
-         args.v_train_itr, args.cg_itr, args.delta)
+         args.v_train_itr, args.cg_itr, args.delta, args.damping_ratio)
