@@ -62,6 +62,7 @@ class mlp_with_diagonal_gaussian:
     """
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
+    # FIXME:
 
     def __init__(self, policy_hid, action_dim):
         self._hid = policy_hid
@@ -74,10 +75,10 @@ class mlp_with_diagonal_gaussian:
         """ KL divergence p0 over p1"""
         var_0 = tf.exp(2*logstd_0)
         mu_1 = p_1[:, 0]
-        logstd_1 = p_1[:, -1]
+        logstd_1 = p_1[:, 1]
         var_1 = tf.exp(2*logstd_1)
 
-        return tf.reduce_mean(tf.reduce_sum(0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1) + logstd_1 - logstd_0))
+        return tf.reduce_mean(tf.reduce_sum(0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1) + logstd_1 - logstd_0, axis=1))
 
     def run(self, s, a, pi_dist_old):
         mu = mlp(
@@ -239,7 +240,7 @@ class trpo_buffer:
         self.path_start_index = 0
 
         if (size > self.end_index):
-            tf.logging.warn(
+            tf.logging.info(
                 'sample size is larger or equal than the buffer size, return all buffer'
             )
             return [
@@ -265,7 +266,7 @@ class trpo_buffer:
 
 def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
          v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-         v_train_itr, cg_itr, delta, damping_ratio):
+         v_train_itr, cg_itr, delta, damping_ratio, backtrack_coeff, backtrack_itr):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -409,7 +410,7 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                         es_len_prev = es_len
             buffer.normalize_adv()
             batch_tuple_all = buffer.sample(episode * steps_per_episode)
-
+            print(batch_tuple_all[-1])
             inputs = {k: v for k, v in zip(all_phs, batch_tuple_all)}
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
@@ -429,18 +430,32 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
             var_pi_flat = tf.concat(
                 values=[tf.reshape(x, [-1, ]) for x in var_pi], axis=0)
             assert (2*delta/(np.dot(Hx(x), x)+EPS)) >= 0
-            param_new_flat = var_pi_flat - \
-                np.sqrt(2*delta/(np.dot(Hx(x), x)+EPS))*x
+            term = np.sqrt(2*delta/(np.dot(Hx(x), x)+EPS))*x
 
             def param_size(p):
                 return int(np.prod(p.shape))
 
-            param_new_splits = tf.split(
-                param_new_flat, [param_size(x) for x in var_pi])
-            params_assign = [tf.assign(p, tf.reshape(
-                p_new, p.shape)) for p, p_new in zip(var_pi, param_new_splits)]
+            def assign_params(var, step):
+                param_new_flat = var - step * term
+                param_new_splits = tf.split(
+                    param_new_flat, [param_size(x) for x in var_pi])
+                params_assign = [tf.assign(p, tf.reshape(
+                    p_new, p.shape)) for p, p_new in zip(var_pi, param_new_splits)]
 
-            sess.run(tf.group(params_assign))
+                sess.run(tf.group(params_assign))
+
+            for j in range(backtrack_itr):
+                assign_params(var_pi_flat, backtrack_coeff ** j)
+                kl, pi_l = sess.run([d_kl, pi_loss], feed_dict=inputs)
+
+                if kl < delta and pi_l < pi_loss_old:
+                    tf.logging.info('find a suitable line step, update params')
+                    break
+                else:
+                    if j == backtrack_itr-1:
+                        tf.logging.info(
+                            'does not find a suitable line step, use old params')
+                        assign_params(var_pi_flat, 0)
 
             for _ in range(v_train_itr):
                 # Update value function
@@ -503,6 +518,8 @@ if __name__ == '__main__':
     # should ne small for stability
     parser.add_argument('--delta', type=float, default=0.01)
     parser.add_argument('--damping_ratio', type=float, default=0.1)
+    parser.add_argument('--backtrack_itr', type=int, default=10)
+    parser.add_argument('--backtrack_coeff', type=float, default=0.8)
     args = parser.parse_args()
 
     env = gym.make(args.env)
@@ -510,4 +527,4 @@ if __name__ == '__main__':
     trpo(0, env, actor_critic, args.epoch, args.episode,
          args.steps_per_episode, args.pi_lr, args.v_lr, args.gamma, args.lamb,
          args.hid, args.buffer_size, args.batch_size, args.pi_train_itr,
-         args.v_train_itr, args.cg_itr, args.delta, args.damping_ratio)
+         args.v_train_itr, args.cg_itr, args.delta, args.damping_ratio, args.backtrack_coeff, args.backtrack_itr)
