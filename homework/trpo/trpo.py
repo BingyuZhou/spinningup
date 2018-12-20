@@ -62,7 +62,7 @@ class mlp_with_diagonal_gaussian:
     """
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
-    # FIXME:
+    # FIXME: KL divergence is larger than the constraints
 
     def __init__(self, policy_hid, action_dim):
         self._hid = policy_hid
@@ -74,8 +74,8 @@ class mlp_with_diagonal_gaussian:
     def kl(self, mu_0, logstd_0, p_1):
         """ KL divergence p0 over p1"""
         var_0 = tf.exp(2*logstd_0)
-        mu_1 = p_1[:, 0]
-        logstd_1 = p_1[:, 1]
+        mu_1 = p_1[:, 0:self._action_dim]
+        logstd_1 = p_1[:, self._action_dim:]
         var_1 = tf.exp(2*logstd_1)
 
         return tf.reduce_mean(tf.reduce_sum(0.5*((var_0 + (mu_1 - mu_0)**2)/(var_1+EPS) - 1) + logstd_1 - logstd_0, axis=1))
@@ -146,7 +146,8 @@ class trpo_buffer:
         if policy_sample == 'categorical':
             self.pidist_buffer = np.zeros(shape=(buffer_size, act_space))
         else:
-            self.pidist_buffer = np.zeros(shape=(buffer_size, 2))  # mu, logstd
+            self.pidist_buffer = np.zeros(
+                shape=(buffer_size, 2 * action_dim[0]))  # mu, logstd
         self.gamma = gamma
         self.lamb = lamb
         self.path_start_index = 0
@@ -158,7 +159,9 @@ class trpo_buffer:
         self.reward_buffer[step] = r
         self.value_buffer[step] = v
         self.logp_buffer[step] = logp
-        self.pidist_buffer[step] = pi_dist
+        self.pidist_buffer[step] = np.concatenate(
+            [pi_dist[0].reshape(-1,), pi_dist[1].reshape(-1, )], axis=0)
+
         self.end_index = step
 
     def cum_discounted_sum(self, x, discount):
@@ -264,9 +267,9 @@ class trpo_buffer:
             ]
 
 
-def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
+def trpo(seed, env_fn, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
          v_lr, gamma, lamb, hid, buffer_size, batch_size, pi_train_itr,
-         v_train_itr, cg_itr, delta, damping_ratio, backtrack_coeff, backtrack_itr):
+         v_train_itr, cg_itr, delta, damping_ratio, backtrack_coeff, backtrack_itr, logger_kwargs):
     """
     Vanilla policy gradeint
     with Generalized Advantage Estimation (GAE)
@@ -274,13 +277,15 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     - suitable for discrete and continous action space
     """
     # model saver
-    logger = EpochLogger()
+    logger = EpochLogger(**logger_kwargs)
+
     logger.save_config(locals())
 
     seed += 10000
     tf.set_random_seed(seed)
     np.random.seed(seed)
 
+    env = env_fn()
     act_dim = env.action_space.shape
     obs_dim = env.observation_space.shape
 
@@ -410,7 +415,7 @@ def trpo(seed, env, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
                         es_len_prev = es_len
             buffer.normalize_adv()
             batch_tuple_all = buffer.sample(episode * steps_per_episode)
-            print(batch_tuple_all[-1])
+
             inputs = {k: v for k, v in zip(all_phs, batch_tuple_all)}
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
@@ -509,7 +514,7 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, nargs='+', default=[64, 64])
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamb', type=float, default=0.97)
-    parser.add_argument('--buffer_size', type=int, default=4200)
+    parser.add_argument('--buffer_size', type=int, default=4001)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--pi_train_itr', type=int, default=5)
     parser.add_argument('--v_train_itr', type=int, default=80)
@@ -520,11 +525,18 @@ if __name__ == '__main__':
     parser.add_argument('--damping_ratio', type=float, default=0.1)
     parser.add_argument('--backtrack_itr', type=int, default=10)
     parser.add_argument('--backtrack_coeff', type=float, default=0.8)
+    parser.add_argument('--exp_name', type=str, default='trpo')
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
-    env = gym.make(args.env)
+    # env = gym.make(args.env)
 
-    trpo(0, env, actor_critic, args.epoch, args.episode,
+    from spinup.utils.run_utils import setup_logger_kwargs
+    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
+
+    # If directly return the gym env object, will cause stack overflow. Should return the function pointer
+
+    trpo(args.seed, lambda: gym.make(args.env), actor_critic, args.epoch, args.episode,
          args.steps_per_episode, args.pi_lr, args.v_lr, args.gamma, args.lamb,
          args.hid, args.buffer_size, args.batch_size, args.pi_train_itr,
-         args.v_train_itr, args.cg_itr, args.delta, args.damping_ratio, args.backtrack_coeff, args.backtrack_itr)
+         args.v_train_itr, args.cg_itr, args.delta, args.damping_ratio, args.backtrack_coeff, args.backtrack_itr, logger_kwargs)
