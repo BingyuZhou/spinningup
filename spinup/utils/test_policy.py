@@ -33,7 +33,8 @@ def load_policy(fpath, itr='last', deterministic=False):
         action_op = model['pi']
 
     # make function for producing an action given a single state
-    get_action = lambda x : sess.run(action_op, feed_dict={model['x']: x[None,:]})
+    def get_action(x): return sess.run(
+        action_op, feed_dict={model['x']: x[None, :]})[0]
 
     # try to load environment from save
     # (sometimes this will fail because the environment could not be pickled)

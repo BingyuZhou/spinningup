@@ -7,3 +7,7 @@ This directory is my own implementation of popular DRL algorithms inspired by [s
 Some tests in Gym envs
 
 - CartPole Balancing
+
+## Trust Region Policy Gradient
+
+

@@ -276,7 +276,6 @@ def ppo(seed, env_fn, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
     obs_dim = env.observation_space.shape
 
     s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name='obs')
-
     adv = tf.placeholder(dtype=tf.float32, shape=None, name='advantage')
     r_to_go = tf.placeholder(
         dtype=tf.float32, shape=None, name='rewards_to_go')
@@ -301,13 +300,11 @@ def ppo(seed, env_fn, actor_critic_fn, epoch, episode, steps_per_episode, pi_lr,
         buffer = ppo_buffer(buffer_size, obs_dim, act_dim, env.action_space.n,
                             gamma, lamb, policy_samp)
 
-    mask1 = tf.cast(tf.less_equal(adv, 0), dtype=adv.dtype)
-    mask2 = tf.cast(tf.greater(adv, 0), dtype=adv.dtype)
-
-    clip = mask1*adv*(1-delta) + mask2*adv*(1+delta)
-
+    # mask1 = tf.cast(tf.less_equal(adv, 0), dtype=adv.dtype)
+    # mask2 = tf.cast(tf.greater(adv, 0), dtype=adv.dtype)
+    # clip = mask1*adv*(1-delta) + mask2*adv*(1+delta)
+    clip = tf.where(adv > 0, (1+delta)*adv, (1-delta)*adv)
     L = tf.minimum(tf.exp(logp-logp_old)*adv, clip)
-
     pi_loss = -tf.reduce_mean(L)
     v_loss = tf.reduce_mean((v - r_to_go)**2)
 
@@ -437,13 +434,13 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamb', type=float, default=0.97)
     parser.add_argument('--buffer_size', type=int, default=4001)
-    parser.add_argument('--batch_size', type=int, default=4000)
-    parser.add_argument('--pi_train_itr', type=int, default=80)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--pi_train_itr', type=int, default=120)
     parser.add_argument('--v_train_itr', type=int, default=80)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--delta', type=float, default=0.2)
-    parser.add_argument('--target_kl', type=float, default=0.01)
+    parser.add_argument('--target_kl', type=float, default=0.03)
     args = parser.parse_args()
 
     # env = gym.make(args.env)
