@@ -61,7 +61,6 @@ class mlp_with_diagonal_gaussian:
     """
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
-    # FIXME: KL divergence is larger than the constraints
 
     def __init__(self, policy_hid, action_dim):
         self._hid = policy_hid
