@@ -26,30 +26,37 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64]):
     Outputs: action, logp_pi, logp, v
     """
     with tf.variable_scope("pi"):
+
         pi = action_space.high[0] * mlp(
             s,
             policy_hid,
-            action_space.shape,
+            action_space.shape[0],
             activation=tf.nn.relu,
             output_activation=tf.nn.tanh,
         )
-
+    # Important: squeeze is very important, it makes sure the q value is with size (batch_size,)
     with tf.variable_scope("q"):
-        q = mlp(
-            tf.concat([s, a], 1),
-            q_hid,
-            1,
-            activation=tf.nn.relu,
-            output_activation=None,
+        q = tf.squeeze(
+            mlp(
+                tf.concat([s, a], 1),
+                q_hid,
+                1,
+                activation=tf.nn.relu,
+                output_activation=None,
+            ),
+            axis=1,
         )
-
+    with tf.variable_scope("q", reuse=True):
         # q_pi is used for the target, approximate max Q(s,a)
-        q_pi = mlp(
-            tf.concat([s, pi], 1),
-            q_hid,
-            1,
-            activation=tf.nn.relu,
-            output_activation=None,
+        q_pi = tf.squeeze(
+            mlp(
+                tf.concat([s, pi], 1),
+                q_hid,
+                1,
+                activation=tf.nn.relu,
+                output_activation=None,
+            ),
+            axis=1,
         )
 
     return pi, q, q_pi
@@ -123,6 +130,8 @@ def ddpg(
     q_train_itr,
     logger_kwargs,
     rho,
+    act_noise=0.1,
+    start_steps=10000,
 ):
     """
     Deep Deterministic Policy Gradient
@@ -142,6 +151,8 @@ def ddpg(
     env = env_fn()
     act_space = env.action_space
     act_dim = env.action_space.shape
+    act_ub = act_space.high[0]
+    act_lb = act_space.low[0]
     obs_dim = env.observation_space.shape
 
     s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="obs")
@@ -162,7 +173,8 @@ def ddpg(
     # Buffer
     buffer = ddpg_buffer(buffer_size, obs_dim, act_dim, gamma)
     # Losses
-    target = r + gamma * (1 - termnt) * q_targ
+    target = r + gamma * (1 - termnt) * q_targ  # size (batch_size, ) !!
+
     q_loss = tf.reduce_mean((q - target) ** 2)
     pi_loss = -tf.reduce_mean(q_pi)
 
@@ -182,6 +194,26 @@ def ddpg(
         ]
     )
 
+    # Seperate target update
+    var_main_pi = tf.trainable_variables(scope="main/pi")
+    var_targ_pi = tf.trainable_variables(scope="targ/pi")
+
+    var_main_q = tf.trainable_variables(scope="main/q")
+    var_targ_q = tf.trainable_variables(scope="targ/q")
+
+    target_update_pi = tf.group(
+        [
+            tf.assign(v_targ, rho * v_targ + (1 - rho) * v)
+            for v_targ, v in zip(var_targ_pi, var_main_pi)
+        ]
+    )
+    target_update_q = tf.group(
+        [
+            tf.assign(v_targ, rho * v_targ + (1 - rho) * v)
+            for v_targ, v in zip(var_targ_q, var_main_q)
+        ]
+    )
+
     # Number of variables
     var_pi = tf.trainable_variables(scope="main/pi")
     var_q = tf.trainable_variables(scope="main/q")
@@ -196,78 +228,97 @@ def ddpg(
 
     all_phs = [s, a, r, s_next, termnt]
     start_time = time.time()
+
+    def test_agent(n=10):
+
+        for _ in range(n):
+            step = 0
+            ob = env.reset()
+            r = 0
+            es_ret = 0
+            done = False
+            while (not done) and step < steps_per_episode:
+                a = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
+                ob, r, done, _ = env.step(a)
+                es_ret += r
+                step += 1
+            logger.store(TestEpRet=es_ret, TestEpLen=step)
+
+    def add_noise(a, std):
+        a += std * np.random.randn(*act_dim)
+
+        return np.clip(a, act_lb, act_ub)
+
     # Training
     with tf.Session() as sess:
-
         sess.run(tf.global_variables_initializer())
         logger.setup_tf_saver(sess, inputs={"x": s}, outputs={"pi": pi, "v": v})
         for ep in range(epoch):
-            es_len = 0
-            es_len_prev = 0
             for es in range(episode):
                 ob = env.reset()  # initial state
                 r_t = 0
                 es_ret = 0
+                es_len = 0
 
                 for step in range(steps_per_episode):
-                    a_t, v_t, logp_t = sess.run(
-                        [pi, v, logp_pi], feed_dict={s: ob.reshape(1, -1)}
-                    )
-                    buffer.add(ob, a_t, r_t, v_t, logp_t, es_len)
-                    ob, r_t, done, _ = env.step(a_t[0])
-
+                    if buffer.size < start_steps:
+                        a_t = env.action_space.sample()
+                        ob_next, r_t, done, _ = env.step(a_t)
+                    else:
+                        a_t, q_t = sess.run(
+                            [pi, q_pi], feed_dict={s: ob.reshape(1, -1)}
+                        )
+                        ob_next, r_t, done, _ = env.step(add_noise(a_t[0], act_noise))
                     es_ret += r_t
                     es_len += 1
+                    # Ignore done if game is terminated by length. Done signal is only meaningful if meeting the terminal state
+                    done = False if es_len == steps_per_episode else done
+                    # TODO: reward is after the action?
+                    buffer.add(ob, a_t, r_t, ob_next, done)
+                    ob = ob_next
 
-                    if done or step == steps_per_episode - 1:
-                        if done:
-                            buffer.final(v=r_t)
-                            logger.store(EpRet=es_ret, EpLen=es_len - es_len_prev)
+                    # Updating
+                    # TODO: seperate target network update
+                    if done or es_len == steps_per_episode:
+                        for _ in range(q_train_itr):
+                            batch_tuple = buffer.sample(batch_size)
+                            inputs_minbatch = {
+                                k: v for k, v in zip(all_phs, batch_tuple)
+                            }
+                            q_ls, q_val, _, _ = sess.run(
+                                [q_loss, q, q_opt, target_update_q],
+                                feed_dict=inputs_minbatch,
+                            )
+                            # print(sess.run(tf.shape(target), feed_dict=inputs_minbatch))
+                            logger.store(LossQ=q_ls, QVal=q_val)
+                        # TODO: different samples for training pi and Q ??
+                        for _ in range(pi_train_itr):
+                            batch_tuple = buffer.sample(batch_size)
+                            inputs_minbatch = {
+                                k: v for k, v in zip(all_phs, batch_tuple)
+                            }
+                            pi_ls, _, _ = sess.run(
+                                [pi_loss, pi_opt, target_update_pi],
+                                feed_dict=inputs_minbatch,
+                            )
+                            logger.store(LossPi=pi_ls)
+                        logger.store(EpLen=es_len, EpRet=es_ret)
 
-                        else:
-                            buffer.final(sess.run(v, feed_dict={s: ob.reshape(1, -1)}))
+                    if done:
                         ob = env.reset()
                         r_t = 0
                         es_ret = 0
-                        es_len_prev = es_len
-            buffer.normalize_adv()
-            batch_tuple_all = buffer.sample(episode * steps_per_episode)
+                        es_len = 0
 
-            inputs = {k: v for k, v in zip(all_phs, batch_tuple_all)}
-            pi_loss_old, v_loss_old = sess.run([pi_loss, v_loss], feed_dict=inputs)
+            # Save info
+            # Save model every epoch
+            logger.save_state({"env": env})
 
-            # Update policy
-            for _ in range(pi_train_itr):
-                batch_tuple = buffer.sample(batch_size)
-                inputs_minbatch = {k: v for k, v in zip(all_phs, batch_tuple)}
-                _, kl = sess.run([pi_opt, approx_kl], feed_dict=inputs_minbatch)
-                if np.mean(kl) > 1.5 * target_kl:
-                    tf.logging.info("Early stop policy update since KL too large")
-                    break
+            # Test performance
 
-            for _ in range(v_train_itr):
-                # Update value function
-                batch_tuple = buffer.sample(batch_size)
-                sess.run(v_opt, feed_dict={r_to_go: batch_tuple[2], s: batch_tuple[0]})
+            test_agent()
 
-            pi_loss_new, v_loss_new, approx_entropy_v, kl = sess.run(
-                [pi_loss, v_loss, approx_entropy, approx_kl], feed_dict=inputs
-            )
-
-            # Save model
-            if (ep % 10 == 0) or (ep == epoch - 1):
-                logger.save_state({"env": env})
-
-            # Log
-            logger.store(
-                LossPi=pi_loss_old,
-                LossV=v_loss_old,
-                DeltaLossPi=pi_loss_new - pi_loss_old,
-                DeltaLossV=v_loss_new - v_loss_old,
-                Entropy=approx_entropy_v,
-                KL=kl,
-            )
-
+            # Logger
             logger.log_tabular("Epoch", ep)
             logger.log_tabular(
                 "TotalEnvInteracts", (ep + 1) * episode * steps_per_episode
@@ -275,32 +326,31 @@ def ddpg(
             logger.log_tabular("EpLen", average_only=True)
             logger.log_tabular("EpRet", with_min_and_max=True)
             logger.log_tabular("LossPi", average_only=True)
-            logger.log_tabular("LossV", average_only=True)
-            logger.log_tabular("DeltaLossPi", average_only=True)
-            logger.log_tabular("DeltaLossV", average_only=True)
-            logger.log_tabular("Entropy", average_only=True)
-            logger.log_tabular("KL", average_only=True)
+            logger.log_tabular("LossQ", average_only=True)
+            logger.log_tabular("QVal", with_min_and_max=True)
+            logger.log_tabular("TestEpRet", with_min_and_max=True)
+            logger.log_tabular("TestEpLen", average_only=True)
             logger.log_tabular("Time", time.time() - start_time)
             logger.dump_tabular()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="arguments for vpg")
-    parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--pi_lr", type=float, default=0.0003)
+    parser.add_argument("--env", type=str, default="MountainCarContinuous-v0")
+    parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--q_lr", type=float, default=0.001)
     parser.add_argument("--epoch", type=int, default=50)
     parser.add_argument("--episode", type=int, default=4)
     parser.add_argument("--steps_per_episode", type=int, default=1000)
     parser.add_argument("--hid", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--buffer_size", type=int, default=4001)
+    parser.add_argument("--buffer_size", type=int, default=1000000)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--pi_train_itr", type=int, default=120)
+    parser.add_argument("--pi_train_itr", type=int, default=80)
     parser.add_argument("--q_train_itr", type=int, default=80)
     parser.add_argument("--exp_name", type=str, default="ddpg")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rho", type=float, default=0.9)
+    parser.add_argument("--rho", type=float, default=0.995)
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
