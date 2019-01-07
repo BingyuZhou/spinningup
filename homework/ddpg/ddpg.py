@@ -173,7 +173,9 @@ def ddpg(
     # Buffer
     buffer = ddpg_buffer(buffer_size, obs_dim, act_dim, gamma)
     # Losses
-    target = r + gamma * (1 - termnt) * q_targ  # size (batch_size, ) !!
+    target = tf.stop_gradient(
+        r + gamma * (1 - termnt) * q_targ
+    )  # size (batch_size, ) !!
 
     q_loss = tf.reduce_mean((q - target) ** 2)
     pi_loss = -tf.reduce_mean(q_pi)
@@ -278,27 +280,22 @@ def ddpg(
                     ob = ob_next
 
                     # Updating
-                    # TODO: seperate target network update
+                    # Tip: Do not seperate training of policy and Q networks. Using the same samples will improve
+                    # the learning process
                     if done or es_len == steps_per_episode:
                         for _ in range(q_train_itr):
                             batch_tuple = buffer.sample(batch_size)
                             inputs_minbatch = {
                                 k: v for k, v in zip(all_phs, batch_tuple)
                             }
-                            q_ls, q_val, _, _ = sess.run(
-                                [q_loss, q, q_opt, target_update_q],
-                                feed_dict=inputs_minbatch,
+                            q_ls, q_val, _ = sess.run(
+                                [q_loss, q, q_opt], feed_dict=inputs_minbatch
                             )
                             # print(sess.run(tf.shape(target), feed_dict=inputs_minbatch))
                             logger.store(LossQ=q_ls, QVal=q_val)
-                        # TODO: different samples for training pi and Q ??
-                        for _ in range(pi_train_itr):
-                            batch_tuple = buffer.sample(batch_size)
-                            inputs_minbatch = {
-                                k: v for k, v in zip(all_phs, batch_tuple)
-                            }
+
                             pi_ls, _, _ = sess.run(
-                                [pi_loss, pi_opt, target_update_pi],
+                                [pi_loss, pi_opt, target_update],
                                 feed_dict=inputs_minbatch,
                             )
                             logger.store(LossPi=pi_ls)
@@ -349,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--pi_train_itr", type=int, default=80)
     parser.add_argument("--q_train_itr", type=int, default=80)
     parser.add_argument("--exp_name", type=str, default="ddpg")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--rho", type=float, default=0.995)
     args = parser.parse_args()
 
