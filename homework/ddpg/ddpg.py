@@ -195,10 +195,8 @@ def ddpg(
     )
 
     # Target initialization
-    target_init= tf.group(
-        [
-            tf.assign(v_targ, v_main)for v_targ, v_main in zip(var_targ, var_main)
-        ]
+    target_init = tf.group(
+        [tf.assign(v_targ, v_main) for v_targ, v_main in zip(var_targ, var_main)]
     )
     # Number of variables
     var_pi = tf.trainable_variables(scope="main/pi")
@@ -252,9 +250,7 @@ def ddpg(
                         a_t = env.action_space.sample()
                         ob_next, r_t, done, _ = env.step(a_t)
                     else:
-                        a_t, q_t = sess.run(
-                            [pi, q_pi], feed_dict={s: ob.reshape(1, -1)}
-                        )
+                        a_t = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
                         ob_next, r_t, done, _ = env.step(add_noise(a_t[0], act_noise))
                     es_ret += r_t
                     es_len += 1
