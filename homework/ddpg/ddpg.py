@@ -126,8 +126,6 @@ def ddpg(
     hid,
     buffer_size,
     batch_size,
-    pi_train_itr,
-    q_train_itr,
     logger_kwargs,
     rho,
     act_noise=0.1,
@@ -193,26 +191,6 @@ def ddpg(
         [
             tf.assign(v_targ, rho * v_targ + (1 - rho) * v)
             for v_targ, v in zip(var_targ, var_main)
-        ]
-    )
-
-    # Seperate target update
-    var_main_pi = tf.trainable_variables(scope="main/pi")
-    var_targ_pi = tf.trainable_variables(scope="targ/pi")
-
-    var_main_q = tf.trainable_variables(scope="main/q")
-    var_targ_q = tf.trainable_variables(scope="targ/q")
-
-    target_update_pi = tf.group(
-        [
-            tf.assign(v_targ, rho * v_targ + (1 - rho) * v)
-            for v_targ, v in zip(var_targ_pi, var_main_pi)
-        ]
-    )
-    target_update_q = tf.group(
-        [
-            tf.assign(v_targ, rho * v_targ + (1 - rho) * v)
-            for v_targ, v in zip(var_targ_q, var_main_q)
         ]
     )
 
@@ -283,7 +261,7 @@ def ddpg(
                     # Tip: Do not seperate training of policy and Q networks. Using the same samples will improve
                     # the learning process
                     if done or es_len == steps_per_episode:
-                        for _ in range(q_train_itr):
+                        for _ in range(es_len):
                             batch_tuple = buffer.sample(batch_size)
                             inputs_minbatch = {
                                 k: v for k, v in zip(all_phs, batch_tuple)
@@ -335,7 +313,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="arguments for vpg")
     parser.add_argument("--env", type=str, default="MountainCarContinuous-v0")
     parser.add_argument("--pi_lr", type=float, default=0.001)
-    parser.add_argument("--q_lr", type=float, default=0.001)
+    parser.add_argument("--q_lr", type=float, default=0.0003)
     parser.add_argument("--epoch", type=int, default=50)
     parser.add_argument("--episode", type=int, default=4)
     parser.add_argument("--steps_per_episode", type=int, default=1000)
@@ -343,10 +321,8 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--buffer_size", type=int, default=1000000)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--pi_train_itr", type=int, default=80)
-    parser.add_argument("--q_train_itr", type=int, default=80)
     parser.add_argument("--exp_name", type=str, default="ddpg")
-    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rho", type=float, default=0.995)
     args = parser.parse_args()
 
@@ -369,8 +345,6 @@ if __name__ == "__main__":
         args.hid,
         args.buffer_size,
         args.batch_size,
-        args.pi_train_itr,
-        args.q_train_itr,
         logger_kwargs,
         args.rho,
     )
