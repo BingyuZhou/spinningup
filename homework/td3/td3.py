@@ -181,7 +181,7 @@ def td3(
     logger_kwargs,
     rho,
     act_noise=0.1,
-    start_steps=10000,
+    start_steps=1e4,
     policy_delay=2,
     target_noise=0.2,
     noise_clip=0.5,
@@ -411,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps_per_episode", type=int, default=1000)
     parser.add_argument("--hid", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--buffer_size", type=int, default=1000000)
+    parser.add_argument("--buffer_size", type=int, default=1e6)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--exp_name", type=str, default="td3")
     parser.add_argument("--seed", type=int, default=0)
