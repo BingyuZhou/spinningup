@@ -7,7 +7,7 @@ import scipy.signal
 import time
 from spinup.utils.logx import EpochLogger
 
-EPS = 1e-8
+EPS = 1e-6
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 tf.logging.set_verbosity(tf.logging.INFO)
@@ -21,8 +21,16 @@ def log_p_gaussian(x, mu, logstd):
     )
 
 
+def clip_but_pass_gradient(x, l=-1.0, u=1.0):
+    clip_up = tf.cast(x > u, tf.float32)
+    clip_low = tf.cast(x < l, tf.float32)
+    return x + tf.stop_gradient((u - x) * clip_up + (l - x) * clip_low)
+
+
 def _squash_correction(actions):
-    return tf.reduce_sum(tf.log(1 - actions ** 2), axis=1)
+    return tf.reduce_sum(
+        tf.log(clip_but_pass_gradient(1 - actions ** 2, 0, 1) + EPS), axis=1
+    )
 
 
 def mlp(x, hid, output_layer, activation, output_activation):
@@ -50,7 +58,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
             activation=tf.nn.relu,
             output_activation=tf.nn.relu,
         )
-        mu = tf.layers.dense(net, act_dim[0], activation=tf.nn.tanh)
+        mu = tf.layers.dense(net, act_dim[0], activation=None)
         # std dev is dependent on state, instead of a shared-across-states learnable parameters
         log_std = tf.layers.dense(net, act_dim[0], activation=tf.nn.tanh)
         # Mapping from (-1,1) to (LOG_STD_MIN, LOG_STD_MAX)
@@ -59,6 +67,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
         )
         std = tf.exp(log_std)
         pi = tf.tanh(mu + tf.random_normal(tf.shape(mu)) * std)
+        mu = tf.tanh(mu)
         # log of squashed likelihood, check paper [SAC](https://arxiv.org/pdf/1801.01290.pdf)
         log_pi = log_p_gaussian(pi, mu, log_std) - _squash_correction(pi)
 
@@ -69,7 +78,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
     with tf.variable_scope("q1"):
         q1 = tf.squeeze(
             mlp(
-                tf.concat([s, a], 1),
+                tf.concat([s, a], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -80,7 +89,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
     with tf.variable_scope("q2"):
         q2 = tf.squeeze(
             mlp(
-                tf.concat([s, a], 1),
+                tf.concat([s, a], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -92,7 +101,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
     with tf.variable_scope("q1", reuse=True):
         q1_pi = tf.squeeze(
             mlp(
-                tf.concat([s, pi], 1),
+                tf.concat([s, pi], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -103,7 +112,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
     with tf.variable_scope("q2", reuse=True):
         q2_pi = tf.squeeze(
             mlp(
-                tf.concat([s, pi], 1),
+                tf.concat([s, pi], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -112,9 +121,11 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
             axis=1,
         )
     with tf.variable_scope("v"):
-        v = tf.squeeze(mlp(s, v_hid, 1, activation=tf.nn.relu, output_activation=None))
+        v = tf.squeeze(
+            mlp(s, v_hid, 1, activation=tf.nn.relu, output_activation=None), axis=1
+        )
 
-    return pi, q1, q2, q1_pi, q2_pi, v, log_pi
+    return mu, pi, q1, q2, q1_pi, q2_pi, v, log_pi
 
 
 class sac_buffer:
@@ -184,11 +195,7 @@ def sac(
     logger_kwargs,
     rho,
     alpha,
-    act_noise=0.1,
     start_steps=1e4,
-    policy_delay=2,
-    target_noise=0.2,
-    noise_clip=0.5,
 ):
     """
     Soft Actor Critic
@@ -224,11 +231,14 @@ def sac(
 
     # Model
     with tf.variable_scope("main"):
-        pi, q1, q2, q1_pi, q2_pi, v, log_pi = actor_critic_fn(
+        mu, pi, q1, q2, q1_pi, q2_pi, v, log_pi = actor_critic_fn(
             s, a, act_space, hid, hid, hid
         )
+    # Attention: target_V is calculated for next state!
     with tf.variable_scope("targ"):
-        pi_targ, _, _, _, _, v_targ, _ = actor_critic_fn(s, a, act_space, hid, hid, hid)
+        _, _, _, _, _, _, v_targ, _ = actor_critic_fn(
+            s_next, a, act_space, hid, hid, hid
+        )
 
     # Buffer
     buffer = sac_buffer(buffer_size, obs_dim, act_dim, gamma)
@@ -237,8 +247,8 @@ def sac(
     target_q = tf.stop_gradient(
         r + gamma * (1 - termnt) * v_targ
     )  # size (batch_size, ) !!
-
-    target_v = tf.stop_gradient(tf.minimum(q1, q2) - alpha * log_pi)
+    # Should use q1_pi, q2_pi as sampled fresh actions of current policy, instead of actions stored in buffer
+    target_v = tf.stop_gradient(tf.minimum(q1_pi, q2_pi) - alpha * log_pi)
     # Losses
     q1_loss = tf.reduce_mean((q1 - target_q) ** 2)
     q2_loss = tf.reduce_mean((q2 - target_q) ** 2)
@@ -277,10 +287,12 @@ def sac(
     var_pi = tf.trainable_variables(scope="main/pi")
     var_q1 = tf.trainable_variables(scope="main/q1")
     var_q2 = tf.trainable_variables(scope="main/q2")
+    var_v = tf.trainable_variables(scope="main/v")
 
     num_pi = 0
     num_q1 = 0
     num_q2 = 0
+    num_v = 0
 
     for v in var_pi:
         num_pi += np.prod(v.shape)
@@ -288,10 +300,12 @@ def sac(
         num_q1 += np.prod(v.shape)
     for v in var_q2:
         num_q2 += np.prod(v.shape)
+    for v in var_v:
+        num_v += np.prod(v.shape)
 
     tf.logging.info(
-        "Number of trainable variables: pi {}, q1 {}, q2 {}".format(
-            num_pi, num_q1, num_q2
+        "Number of trainable variables: pi {}, q1 {}, q2 {}, v {}".format(
+            num_pi, num_q1, num_q2, num_v
         )
     )
 
@@ -307,24 +321,22 @@ def sac(
             es_ret = 0
             done = False
             while (not done) and step < steps_per_episode:
-                a = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
-                ob, r, done, _ = env.step(a)
+                a = sess.run(mu, feed_dict={s: ob.reshape(1, -1)})
+                ob, r, done, _ = env.step(a[0])
                 es_ret += r
                 step += 1
             logger.store(TestEpRet=es_ret, TestEpLen=step)
-
-    def add_noise(a, std):
-        a += std * np.random.randn(*act_dim)
-
-        return np.clip(a, act_lb, act_ub)
 
     # Training
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         sess.run(target_int)
         logger.setup_tf_saver(
-            sess, inputs={"x": s, "a": a}, outputs={"pi": pi, "q1": q1, "q2": q2}
+            sess,
+            inputs={"x": s, "a": a},
+            outputs={"pi": pi, "q1": q1, "q2": q2, "v": v},
         )
+
         for ep in range(epoch):
             for es in range(episode):
                 ob = env.reset()  # initial state
@@ -338,7 +350,7 @@ def sac(
                         ob_next, r_t, done, _ = env.step(a_t)
                     else:
                         a_t = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
-                        ob_next, r_t, done, _ = env.step(add_noise(a_t[0], act_noise))
+                        ob_next, r_t, done, _ = env.step(a_t[0])
                     es_ret += r_t
                     es_len += 1
                     # Ignore done if game is terminated by length. Done signal is only meaningful if meeting the terminal state
@@ -356,21 +368,36 @@ def sac(
                             inputs_minbatch = {
                                 k: v for k, v in zip(all_phs, batch_tuple)
                             }
-                            q1_ls, q2_ls, q1_val, q2_val, _, _ = sess.run(
-                                [q1_loss, q2_loss, q1, q2, q1_opt, q2_opt],
+                            q1_ls, q2_ls, q1_val, q2_val, log_pi_val, _, _ = sess.run(
+                                [q1_loss, q2_loss, q1, q2, log_pi, q1_opt, q2_opt],
                                 feed_dict=inputs_minbatch,
                             )
-                            # print(sess.run(tf.shape(target), feed_dict=inputs_minbatch))
-                            logger.store(
-                                LossQ1=q1_ls, LossQ2=q2_ls, Q1Val=q1_val, Q2Val=q2_val
+                            v_ls, v_val, _ = sess.run(
+                                [v_loss, v, v_opt], feed_dict=inputs_minbatch
+                            )
+                            pi_ls, _, = sess.run(
+                                [pi_loss, pi_opt], feed_dict=inputs_minbatch
                             )
 
-                            if i % policy_delay == 0:
-                                pi_ls, _, _ = sess.run(
-                                    [pi_loss, pi_opt, target_update],
-                                    feed_dict=inputs_minbatch,
-                                )
-                                logger.store(LossPi=pi_ls)
+                            sess.run(target_update, feed_dict=inputs_minbatch)
+                            # print(
+                            #     sess.run(tf.shape(target_q), feed_dict=inputs_minbatch)
+                            # )
+                            # print(
+                            #     sess.run(tf.shape(target_v), feed_dict=inputs_minbatch)
+                            # )
+
+                            logger.store(
+                                LossQ1=q1_ls,
+                                LossQ2=q2_ls,
+                                LossV=v_ls,
+                                LossPi=pi_ls,
+                                Q1Val=q1_val,
+                                Q2Val=q2_val,
+                                VVal=v_val,
+                                Log_pi=log_pi_val,
+                            )
+
                         logger.store(EpLen=es_len, EpRet=es_ret)
 
                     if done:
@@ -397,9 +424,12 @@ def sac(
             logger.log_tabular("LossPi", average_only=True)
             logger.log_tabular("LossQ1", average_only=True)
             logger.log_tabular("LossQ2", average_only=True)
+            logger.log_tabular("LossV", average_only=True)
 
             logger.log_tabular("Q1Val", with_min_and_max=True)
             logger.log_tabular("Q2Val", with_min_and_max=True)
+            logger.log_tabular("VVal", with_min_and_max=True)
+            logger.log_tabular("Log_pi", with_min_and_max=True)
 
             logger.log_tabular("TestEpRet", with_min_and_max=True)
             logger.log_tabular("TestEpLen", average_only=True)
@@ -416,14 +446,14 @@ if __name__ == "__main__":
     parser.add_argument("--epoch", type=int, default=50)
     parser.add_argument("--episode", type=int, default=4)
     parser.add_argument("--steps_per_episode", type=int, default=1000)
-    parser.add_argument("--hid", type=int, nargs="+", default=[64, 64])
+    parser.add_argument("--hid", type=int, nargs="+", default=[300, 300])
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--buffer_size", type=int, default=1e6)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--buffer_size", type=int, default=int(1e6))
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--exp_name", type=str, default="sac")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rho", type=float, default=0.995)
-    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=0.2)
 
     args = parser.parse_args()
 
