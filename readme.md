@@ -16,3 +16,16 @@ This module contains a variety of helpful resources, including:
 - and a few [exercises](https://spinningup.openai.com/en/latest/spinningup/exercises.html) to serve as warm-ups.
 
 Get started at [spinningup.openai.com](https://spinningup.openai.com)!
+
+## Tips:
+
+When running Mujoco-py test, if you have error
+
+```
+ERROR: GLEW initalization error: Missing GL version
+```
+Try to run with the preload, reference to this [git issue](https://github.com/openai/mujoco-py/issues/75)
+
+```
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so python your_file.py
+```
