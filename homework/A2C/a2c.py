@@ -5,6 +5,7 @@ import numpy as np
 from spinup.utils.logx import EpochLogger
 import gym
 import argparse
+import scipy
 
 EPS = 1e-8
 
@@ -107,16 +108,59 @@ def actor_critic(action_space, s, a, common_hid):
     return pi, logp, logp_pi, v
 
 
+def cum_discounted_sum(x, discount):
+    """
+        Magic formula to compute cummunated sum of discounted value (Faster)
+        Input: x = [x1, x2, x3]
+        Output: x1+discount*x2+discount^2*x3, x2+discount*x3, x3
+        """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
 # Operations in seperate worker(single process)
-def a3c_worker():
-    pass
+def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma):
+    # Sampling in local environment, collecting rewards-to-go and logp
+    ob = env.reset()
+    done = False
+    r_t_buffer = []
+    state_buffer = []
+    v_buffer = []
+    action_buffer = []
+
+    while not done and ep_len < steps_per_episode:
+        a_t, v_t = sess.run([pi, v], feed_dict={s: ob.reshape(1, -1)})
+        state_buffer.append(ob.reshape(1, -1))
+        action_buffer.append(a_t)
+        v_buffer.append(v_t)
+
+        ob, r_t, done, _ = env.step(a_t)
+
+        r_t_buffer.append(r_t)
+        ep_len += 1
+        global_step += 1
+
+    # Booststrap final state
+    if done:
+        r_t_buffer.append(0)
+    else:
+        r_t_buffer.append(sess.run(v, feed_dict={s: ob.reshape(1, -1)}))
+
+    # rewards-to-go
+    r_to_go = cum_discounted_sum(np.asanyarray(r_t_buffer), gamma)[:-1]
+
+    return (
+        global_step,
+        r_to_go,
+        np.asanyarray(state_buffer),
+        np.asanyarray(action_buffer),
+        np.asanyarray(v_buffer),
+    )
 
 
 def a3c(
     seed,
     env_name,
-    epoch,
-    episode,
+    max_step,
     steps_per_episode,
     pi_lr,
     v_lr,
@@ -139,13 +183,11 @@ def a3c(
     # Global parameters
     if job_nm == "ps":
         server.join()
-    # Local workers
     else:
-        with tf.device(
-            tf.train.replica_device_setter(
-                worker_device="/job:worker/task:%d" % task_ind, cluster=cluster
-            )
-        ):
+        # Local graph
+        # Tips: when using tf.train.replica_device_setter(), all the variables (mainly weights of networks)
+        # are placed in ps taskes by default. Other operations and states are placed in work_device, which means there is NO local copy of variables!!
+        with tf.device("/job:worker/task:%d" % task_ind):
             # Env
             env = gym.make(env_name)
             act_space = env.action_space
@@ -191,14 +233,89 @@ def a3c(
             v_loss = tf.reduce_mean((v - ret) ** 2)
 
             # Optimizers
-            pi_grad = tf.train.RMSPropOptimizer(learning_rate=pi_lr).compute_gradients(
-                loss=pi_loss
+            pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr)
+            pi_grad = pi_opt.compute_gradients(loss=pi_loss, var_list=var_com + var_pi)
+            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr)
+            v_grad = v_opt.compute_gradients(loss=v_loss, var_list=var_com + var_v)
+
+            # Local ep_len
+            ep_len = 0
+
+        # Global graph
+        with tf.device("/job:ps/task:0"):
+            # Global Env
+            env_g = gym.make(env_name)
+
+            # Placeholders
+            s_g = tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name="s")
+            a_g = tf.placeholder(dtype=tf.float32, shape=(None, act_dim), name="a")
+            r_g = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="r")
+            ret_g = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="return")
+
+            # Actor Critic model
+            pi_g, logp_g, logp_pi_g, v_g = actor_critic(act_space, s_g, a_g, hid)
+
+            # Global params
+            var_com_g = tf.trainable_variables(scope="model/common")
+            var_pi_g = tf.trainable_variables(scope="model/pi")
+            var_v_g = tf.trainable_variables(scope="model/v")
+
+            var_com_pi_g = var_com_g + var_pi_g
+            var_com_v_g = var_com_g + var_v_g
+
+            # Global step
+            global_step = 0
+
+        # Asyn update global params
+        with tf.device("/job:worker/task:%d" % task_ind):
+
+            asyn_pi_update = pi_opt.apply_gradients(
+                [(var_com_pi_g[i], pi_grad[i][1])] for i in len(pi_grad)
             )
-            v_grad = tf.train.RMSPropOptimizer(learning_rate=v_lr).compute_gradients(
-                loss=v_loss
+            asyn_v_update = v_opt.apply_gradients(
+                [(var_com_v_g[i], v_grad[i][1])] for i in len(pi_grad)
+            )
+
+            asyn_update = tf.group([asyn_pi_update, asyn_v_update])
+
+        # Sync gloabl params -> local params
+        with tf.device("/job:ps/task:0"):
+            sync_local_params = tf.group(
+                [
+                    tf.assign(v, v_g)
+                    for v, v_g in zip(
+                        [var_com, var_pi, var_v], [var_com_g, var_pi_g, var_v_g]
+                    )
+                ]
             )
 
         # Training in worker
+
+        with tf.Session(server.target) as sess:
+            sess.run(tf.global_variables_initializer())
+            while global_step < max_step:
+                sess.run(sync_local_params)
+
+                global_step, r_to_go, state_buffer, action_buffer, v_buffer = a3c_worker(
+                    sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma
+                )
+
+                v_grad_val, = sess.run(
+                    v_grad, feed_dict={s: state_buffer, ret: r_to_go}
+                )
+                pi_grad_val = sess.run(
+                    pi_grad,
+                    feed_dict={
+                        s: state_buffer,
+                        a: action_buffer,
+                        v: v_buffer,
+                        ret: r_to_go,
+                    },
+                )
+
+                sess.run(
+                    asyn_update, feed_dict={pi_grad: pi_grad_val, v_grad: v_grad_val}
+                )
 
 
 if __name__ == "__main__":
@@ -208,9 +325,8 @@ if __name__ == "__main__":
     parser.add_argument("--env", type=str, default="Pendulum-v0")
     parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
-    parser.add_argument("--epoch", type=int, default=50)
-    parser.add_argument("--episode", type=int, default=4)
-    parser.add_argument("--steps_per_episode", type=int, default=1000)
+    parser.add_argument("--max_step", type=int, default=1e6)
+    parser.add_argument("--steps_per_episode", type=int, default=1e3)
     parser.add_argument("--hid", type=int, nargs="+", default=[300, 300])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--exp_name", type=str, default="a3c")
@@ -238,8 +354,7 @@ if __name__ == "__main__":
     a3c(
         args.seed,
         args.env,
-        args.epoch,
-        args.episode,
+        args.max_step,
         args.steps_per_episode,
         args.pi_lr,
         args.v_lr,
