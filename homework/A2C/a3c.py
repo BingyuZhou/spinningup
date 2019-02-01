@@ -46,7 +46,7 @@ class mlp_with_categorical:
             )
         with tf.variable_scope("pi"):
             logits = mlp(
-                com, None, self._action_dim, activation=None, output_activation=None
+                com, [], self._action_dim, activation=None, output_activation=None
             )
             logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
             pi = tf.squeeze(
@@ -66,12 +66,10 @@ class mlp_with_diagonal_gaussian:
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
 
-    def __init__(self, policy_hid, action_dim):
+    def __init__(self, policy_hid, action_dim, log_std):
         self._hid = policy_hid
         self._action_dim = action_dim
-        self.logstd = tf.get_variable(
-            "log_std", initializer=-0.5 * np.ones(action_dim, dtype=tf.float32)
-        )
+        self.logstd = log_std
 
     def run(self, s, a):
         with tf.variable_scope("common"):
@@ -83,7 +81,7 @@ class mlp_with_diagonal_gaussian:
                 output_activation=tf.tanh,
             )
         with tf.variable_scope("pi"):
-            mu = mlp(com, None, self._action_dim, None, None)
+            mu = mlp(com, [], *self._action_dim, None, None)
             std = tf.exp(self.logstd)
             pi = tf.random_normal(tf.shape(mu)) * std + mu
             logp = log_p_gaussian(a, mu, self.logstd)
@@ -92,18 +90,18 @@ class mlp_with_diagonal_gaussian:
 
 
 # Actor-critic
-def actor_critic(action_space, s, a, common_hid):
+def actor_critic(action_space, s, a, common_hid, log_std):
 
     with tf.variable_scope("model"):
         if isinstance(action_space, gym.spaces.Box):
             # Continuous action
-            actor = mlp_with_diagonal_gaussian(common_hid, action_space.shape)
+            actor = mlp_with_diagonal_gaussian(common_hid, action_space.shape, log_std)
         else:
             # Discrete action
             actor = mlp_with_categorical(common_hid, action_space.n)
         com, pi, logp, logp_pi = actor.run(s, a)
         with tf.variable_scope("v"):
-            v = mlp(com, None, 1, None, None)
+            v = mlp(com, [], 1, None, None)
 
     return pi, logp, logp_pi, v
 
@@ -129,11 +127,11 @@ def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamm
 
     while not done and ep_len < steps_per_episode:
         a_t, v_t = sess.run([pi, v], feed_dict={s: ob.reshape(1, -1)})
-        state_buffer.append(ob.reshape(1, -1))
-        action_buffer.append(a_t)
+        state_buffer.append(ob)
+        action_buffer.append(a_t[0])
         v_buffer.append(v_t)
 
-        ob, r_t, done, _ = env.step(a_t)
+        ob, r_t, done, _ = env.step(a_t[0])
 
         r_t_buffer.append(r_t)
         ep_len += 1
@@ -184,38 +182,69 @@ def a3c(
     if job_nm == "ps":
         server.join()
     else:
+        # Global graph
+        with tf.device("/job:ps/task:0"):
+            # Global Env
+            env_g = gym.make(env_name)
+            act_space = env_g.action_space
+            act_dim = env_g.action_space.shape
+            act_ub = act_space.high[0]
+            act_lb = act_space.low[0]
+            obs_dim = env_g.observation_space.shape
+
+            # Shared global params
+            global_step = 0
+            log_std = tf.get_variable(
+                "log_std", initializer=-0.5 * np.ones(act_dim, dtype=np.float32)
+            )
+
+            # Placeholders
+            s_g = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
+            a_g = tf.placeholder(dtype=tf.float32, shape=(None, *act_dim), name="a")
+
+            # Actor Critic model
+            with tf.variable_scope("global"):
+                pi_g, logp_g, logp_pi_g, v_g = actor_critic(
+                    act_space, s_g, a_g, hid, log_std
+                )
+
+            # Global params
+            var_com_g = tf.trainable_variables(scope="global/model/common")
+            var_pi_g = tf.trainable_variables(scope="global/model/pi")
+            var_v_g = tf.trainable_variables(scope="global/model/v")
+            print("!!global{}".format(var_pi_g[0].device))
+
+            var_com_pi_g = var_com_g + var_pi_g
+            var_com_v_g = var_com_g + var_v_g
+
         # Local graph
         # Tips: when using tf.train.replica_device_setter(), all the variables (mainly weights of networks)
         # are placed in ps taskes by default. Other operations and states are placed in work_device, which means there is NO local copy of variables!!
         with tf.device("/job:worker/task:%d" % task_ind):
             # Env
             env = gym.make(env_name)
-            act_space = env.action_space
-            act_dim = env.action_space.shape
-            act_ub = act_space.high[0]
-            act_lb = act_space.low[0]
-            obs_dim = env.observation_space.shape
 
             # Placeholders
-            s = tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name="s")
-            a = tf.placeholder(dtype=tf.float32, shape=(None, act_dim), name="a")
-            r = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="r")
-            ret = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="return")
+            s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
+            a = tf.placeholder(dtype=tf.float32, shape=(None, *act_dim), name="a")
+            ret = tf.placeholder(dtype=tf.float32, shape=(None,), name="return")
 
             # Actor Critic model
-            pi, logp, logp_pi, v = actor_critic(act_space, s, a, hid)
+            pi, logp, logp_pi, v = actor_critic(act_space, s, a, hid, log_std)
 
             # Local params
-            var_com = tf.local_variables(scope="model/common")
-            var_pi = tf.local_variables(scope="model/pi")
-            var_v = tf.local_variables(scope="model/v")
+            var_com = tf.trainable_variables(scope="model/common")
+            var_pi = tf.trainable_variables(scope="model/pi")
+            var_v = tf.trainable_variables(scope="model/v")
+
+            print("!!{}".format(var_pi[0].device))
 
             num_com = 0
             num_pi = 0
             num_v = 0
 
             for v in var_com:
-                num_v += np.prod(v.shape)
+                num_com += np.prod(v.shape)
             for v in var_pi:
                 num_pi += np.prod(v.shape)
             for v in var_v:
@@ -241,39 +270,20 @@ def a3c(
             # Local ep_len
             ep_len = 0
 
-        # Global graph
-        with tf.device("/job:ps/task:0"):
-            # Global Env
-            env_g = gym.make(env_name)
-
-            # Placeholders
-            s_g = tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name="s")
-            a_g = tf.placeholder(dtype=tf.float32, shape=(None, act_dim), name="a")
-            r_g = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="r")
-            ret_g = tf.placeholder(dtype=tf.float32, shape=(None, 1), name="return")
-
-            # Actor Critic model
-            pi_g, logp_g, logp_pi_g, v_g = actor_critic(act_space, s_g, a_g, hid)
-
-            # Global params
-            var_com_g = tf.trainable_variables(scope="model/common")
-            var_pi_g = tf.trainable_variables(scope="model/pi")
-            var_v_g = tf.trainable_variables(scope="model/v")
-
-            var_com_pi_g = var_com_g + var_pi_g
-            var_com_v_g = var_com_g + var_v_g
-
-            # Global step
-            global_step = 0
-
         # Asyn update global params
         with tf.device("/job:worker/task:%d" % task_ind):
 
             asyn_pi_update = pi_opt.apply_gradients(
-                [(var_com_pi_g[i], pi_grad[i][1])] for i in len(pi_grad)
+                [
+                    (grad_var_pair[0], var)
+                    for grad_var_pair, var in zip(pi_grad, var_com_pi_g)
+                ]
             )
             asyn_v_update = v_opt.apply_gradients(
-                [(var_com_v_g[i], v_grad[i][1])] for i in len(pi_grad)
+                [
+                    (grad_var_pair[0], var)
+                    for grad_var_pair, var in zip(v_grad, var_com_v_g)
+                ]
             )
 
             asyn_update = tf.group([asyn_pi_update, asyn_v_update])
@@ -284,13 +294,12 @@ def a3c(
                 [
                     tf.assign(v, v_g)
                     for v, v_g in zip(
-                        [var_com, var_pi, var_v], [var_com_g, var_pi_g, var_v_g]
+                        var_com + var_pi + var_v, var_com_g + var_pi_g + var_v_g
                     )
                 ]
             )
 
         # Training in worker
-
         with tf.Session(server.target) as sess:
             sess.run(tf.global_variables_initializer())
             while global_step < max_step:
@@ -299,22 +308,18 @@ def a3c(
                 global_step, r_to_go, state_buffer, action_buffer, v_buffer = a3c_worker(
                     sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma
                 )
-
-                v_grad_val, = sess.run(
-                    v_grad, feed_dict={s: state_buffer, ret: r_to_go}
+                print(v_grad)
+                v_grad_val, _ = sess.run(
+                    [v_grad, asyn_v_update], feed_dict={s: state_buffer, ret: r_to_go}
                 )
-                pi_grad_val = sess.run(
-                    pi_grad,
+                pi_grad_val, _ = sess.run(
+                    [pi_grad, asyn_pi_update],
                     feed_dict={
                         s: state_buffer,
                         a: action_buffer,
                         v: v_buffer,
                         ret: r_to_go,
                     },
-                )
-
-                sess.run(
-                    asyn_update, feed_dict={pi_grad: pi_grad_val, v_grad: v_grad_val}
                 )
 
 
@@ -333,7 +338,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--numProc", type=int, default=3)
 
-    parser.add_argument("--ps_host", type=str, default="127.0.0.1:12222")
+    parser.add_argument("--ps_host", type=str, nargs="+", default=["127.0.0.1:12222"])
     parser.add_argument(
         "--worker_host",
         type=str,
