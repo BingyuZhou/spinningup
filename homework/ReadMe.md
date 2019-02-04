@@ -36,5 +36,9 @@ Very similar to DDPG but with following quirks:
 ## Soft Actor Critic
 
 
+## A3C
+
+*Run this algorithm in tensorflow-cpu, NOT tensorflow-gpu!*
+
 
 

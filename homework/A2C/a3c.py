@@ -174,6 +174,7 @@ def a3c(
     worker_host,
     job_nm,
     task_ind,
+    alpha=0.2,
 ):
     # Cluster
     cluster = tf.train.ClusterSpec({"ps": ps_host, "worker": worker_host})
@@ -264,8 +265,8 @@ def a3c(
                 )
             )
 
-            # Losses
-            pi_loss = -tf.reduce_mean(logp * adv)
+            # Losses with entropy
+            pi_loss = -tf.reduce_mean(logp * adv - alpha * logp_pi)
             v_loss = tf.reduce_mean((v - ret) ** 2)
 
             # Optimizers
@@ -309,6 +310,11 @@ def a3c(
 
         # Training in worker
         with tf.Session(server.target) as sess:
+            if job_nm == "worker" and task_ind == 0:
+                logger.setup_tf_saver(
+                    sess, inputs={"x": s, "a": a}, outputs={"pi": pi, "v": v}
+                )
+
             sess.run(tf.global_variables_initializer())
             while global_step < max_step:
                 sess.run(sync_local_params)
@@ -328,12 +334,15 @@ def a3c(
                 # log in chief node
                 if job_nm == "worker" and task_ind == 0:
                     logger.store(LossV=ls_v, LossPi=ls_pi, EpochRet=ep_ret)
-
-                    logger.log_tabular("GlobalStep", global_step)
-                    logger.log_tabular("LossV", average_only=True)
-                    logger.log_tabular("LossPi", average_only=True)
-                    logger.log_tabular("EpochRet", with_min_and_max=True)
-                    logger.dump_tabular()
+                    if global_step % 100 == 0:
+                        # Save model
+                        logger.save_state({"env": env})
+                        # Log diagnostics
+                        logger.log_tabular("GlobalStep", global_step)
+                        logger.log_tabular("LossV", average_only=True)
+                        logger.log_tabular("LossPi", average_only=True)
+                        logger.log_tabular("EpochRet", with_min_and_max=True)
+                        logger.dump_tabular()
 
 
 if __name__ == "__main__":
