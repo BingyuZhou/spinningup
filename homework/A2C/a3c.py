@@ -10,7 +10,7 @@ import scipy
 
 EPS = 1e-8
 
-tf.logging.set_verbosity(tf.logging.INFO)
+tf.logging.set_verbosity(tf.logging.WARN)
 
 
 def log_p_gaussian(x, mu, logstd):
@@ -67,10 +67,11 @@ class mlp_with_diagonal_gaussian:
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
 
-    def __init__(self, policy_hid, action_dim, log_std):
+    def __init__(self, policy_hid, action_dim, LOG_STD_MAX, LOG_STD_MIN):
         self._hid = policy_hid
         self._action_dim = action_dim
-        self.logstd = log_std
+        self._LOG_STD_MAX = LOG_STD_MAX
+        self._LOG_STD_MIN = LOG_STD_MIN
 
     def run(self, s, a):
         with tf.variable_scope("common"):
@@ -81,22 +82,30 @@ class mlp_with_diagonal_gaussian:
                 activation=tf.nn.tanh,
                 output_activation=tf.tanh,
             )
+
+            log_std = tf.layers.dense(com, *self._action_dim, activation=tf.tanh)
+            # Mapping from (-1,1) to (LOG_STD_MIN, LOG_STD_MAX)
+            log_std = 0.5 * (self._LOG_STD_MAX - self._LOG_STD_MIN) * log_std + 0.5 * (
+                self._LOG_STD_MAX + self._LOG_STD_MIN
+            )
         with tf.variable_scope("pi"):
             mu = mlp(com, [], *self._action_dim, None, None)
-            std = tf.exp(self.logstd)
+            std = tf.exp(log_std)
             pi = tf.random_normal(tf.shape(mu)) * std + mu
-            logp = log_p_gaussian(a, mu, self.logstd)
-            logp_pi = log_p_gaussian(pi, mu, self.logstd)
+            logp = log_p_gaussian(a, mu, log_std)
+            logp_pi = log_p_gaussian(pi, mu, log_std)
         return com, pi, logp, logp_pi
 
 
 # Actor-critic
-def actor_critic(action_space, s, a, common_hid, log_std):
+def actor_critic(action_space, s, a, common_hid, LOG_STD_MAX, LOG_STD_MIN):
 
     with tf.variable_scope("model"):
         if isinstance(action_space, gym.spaces.Box):
             # Continuous action
-            actor = mlp_with_diagonal_gaussian(common_hid, action_space.shape, log_std)
+            actor = mlp_with_diagonal_gaussian(
+                common_hid, action_space.shape, LOG_STD_MAX, LOG_STD_MIN
+            )
         else:
             # Discrete action
             actor = mlp_with_categorical(common_hid, action_space.n)
@@ -168,13 +177,12 @@ def a3c(
     v_lr,
     gamma,
     hid,
-    logger_kwargs,
     numProc,
     ps_host,
     worker_host,
     job_nm,
     task_ind,
-    alpha=0.2,
+    alpha=0.1,
 ):
     # Cluster
     cluster = tf.train.ClusterSpec({"ps": ps_host, "worker": worker_host})
@@ -197,9 +205,8 @@ def a3c(
 
             # Shared global params
             global_step = 0
-            log_std = tf.get_variable(
-                "log_std", initializer=-0.5 * np.ones(act_dim, dtype=np.float32)
-            )
+            LOG_STD_MAX = 2
+            LOG_STD_MIN = -20
 
             # Placeholders
             s_g = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
@@ -211,7 +218,7 @@ def a3c(
             # Actor Critic model
             with tf.variable_scope("global"):
                 pi_g, logp_g, logp_pi_g, v_g = actor_critic(
-                    act_space, s_g, a_g, hid, log_std
+                    act_space, s_g, a_g, hid, LOG_STD_MAX, LOG_STD_MIN
                 )
 
             # Global params
@@ -240,7 +247,9 @@ def a3c(
             adv = tf.placeholder(dtype=tf.float32, shape=(None,), name="advantage")
 
             # Actor Critic model
-            pi, logp, logp_pi, v = actor_critic(act_space, s, a, hid, log_std)
+            pi, logp, logp_pi, v = actor_critic(
+                act_space, s, a, hid, LOG_STD_MAX, LOG_STD_MIN
+            )
 
             # Local params
             var_com = tf.trainable_variables(scope="model/common")
@@ -284,6 +293,20 @@ def a3c(
                     exp_name="a3c", seed=0, data_dir="../../data/"
                 )
                 logger = EpochLogger(**kwargs)
+                logger.save_config(
+                    {
+                        "env": env,
+                        "max_step": max_step,
+                        "steps_per_episode": steps_per_episode,
+                        "pi_lr": pi_lr,
+                        "v_lr": v_lr,
+                        "gamma": gamma,
+                        "alpha": alpha,
+                        "hid": hid,
+                        "ps_host": ps_host,
+                        "worker_host": worker_host,
+                    }
+                )
 
         # Asyn update global params
         asyn_pi_update = pi_opt.apply_gradients(
@@ -296,8 +319,6 @@ def a3c(
             [(grad_var_pair[0], var) for grad_var_pair, var in zip(v_grad, var_com_v_g)]
         )
 
-        asyn_update = tf.group([asyn_pi_update, asyn_v_update])
-
         # Sync gloabl params -> local params
         sync_local_params = tf.group(
             [
@@ -307,6 +328,20 @@ def a3c(
                 )
             ]
         )
+
+        def test(sess, logger, n=10):
+            for _ in range(n):
+                step = 0
+                ob = env_g.reset()
+                r_t = 0
+                ep_ret = 0
+                done = False
+                while (not done) and step < steps_per_episode:
+                    a_t = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
+                    ob, r_t, done, _ = env_g.step(a_t[0])
+                    ep_ret += r_t
+                    step += 1
+                logger.store(TestEpRet=ep_ret, TestEpLen=step)
 
         # Training in worker
         with tf.Session(server.target) as sess:
@@ -323,26 +358,32 @@ def a3c(
                     sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma
                 )
 
-                v_grad_val, _, ls_v = sess.run(
+                _, _, ls_v = sess.run(
                     [v_grad, asyn_v_update, v_loss],
                     feed_dict={s: state_buffer, a: action_buffer, ret: r_to_go},
                 )
-                pi_grad_val, _, ls_pi = sess.run(
+                _, _, ls_pi = sess.run(
                     [pi_grad, asyn_pi_update, pi_loss],
                     feed_dict={s: state_buffer, a: action_buffer, adv: adv_buffer},
                 )
                 # log in chief node
                 if job_nm == "worker" and task_ind == 0:
-                    logger.store(LossV=ls_v, LossPi=ls_pi, EpochRet=ep_ret)
-                    if global_step % 100 == 0:
+                    logger.store(LossV=ls_v, LossPi=ls_pi, EpRet=ep_ret)
+                    if global_step % 200 <= 20:
+                        test(sess, logger)
+
                         # Save model
                         logger.save_state({"env": env})
+
                         # Log diagnostics
-                        logger.log_tabular("GlobalStep", global_step)
+                        logger.log_tabular("TotalEnvInteracts", global_step)
                         logger.log_tabular("LossV", average_only=True)
                         logger.log_tabular("LossPi", average_only=True)
-                        logger.log_tabular("EpochRet", with_min_and_max=True)
+                        logger.log_tabular("EpRet", with_min_and_max=True)
+                        logger.log_tabular("TestEpRet", with_min_and_max=True)
+                        logger.log_tabular("TestEpLen", average_only=True)
                         logger.dump_tabular()
+            tf.logging.warn("process %d is done" % task_ind)
 
 
 if __name__ == "__main__":
@@ -350,11 +391,11 @@ if __name__ == "__main__":
         description="arguments for a3c, distributed tensorflow version"
     )
     parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--pi_lr", type=float, default=0.0003)
+    parser.add_argument("--pi_lr", type=float, default=0.0006)
     parser.add_argument("--v_lr", type=float, default=0.001)
-    parser.add_argument("--max_step", type=int, default=2e5)
-    parser.add_argument("--steps_per_episode", type=int, default=1e3)
-    parser.add_argument("--hid", type=int, nargs="+", default=[300, 300])
+    parser.add_argument("--max_step", type=int, default=1e5)
+    parser.add_argument("--steps_per_episode", type=int, default=500)
+    parser.add_argument("--hid", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--exp_name", type=str, default="a3c")
     parser.add_argument("--seed", type=int, default=0)
@@ -365,16 +406,18 @@ if __name__ == "__main__":
         "--worker_host",
         type=str,
         nargs="+",
-        default=["127.0.0.1:12223", "127.0.0.1:12224"],
+        default=[
+            "127.0.0.1:12223",
+            "127.0.0.1:12224",
+            "127.0.0.1:12225",
+            "127.0.0.1:12226",
+            "127.0.0.1:12227",
+        ],
     )
     parser.add_argument("--job_nm", type=str, default="ps")
     parser.add_argument("--task_ind", type=int, default=0)
 
     args = parser.parse_args()
-
-    from spinup.utils.run_utils import setup_logger_kwargs
-
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     # If directly return the gym env object, will cause stack overflow. Should return the function pointer
 
@@ -387,7 +430,6 @@ if __name__ == "__main__":
         args.v_lr,
         args.gamma,
         args.hid,
-        logger_kwargs,
         args.numProc,
         args.ps_host,
         args.worker_host,
