@@ -126,7 +126,7 @@ def cum_discounted_sum(x, discount):
 
 
 # Operations in seperate worker(single process)
-def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma):
+def a3c_worker(sess, env, s, pi, v, steps_per_episode, gamma):
     # Sampling in local environment, collecting rewards-to-go and logp
     ob = env.reset()
     done = False
@@ -134,6 +134,7 @@ def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamm
     state_buffer = []
     v_buffer = []
     action_buffer = []
+    ep_len = 0
 
     while not done and ep_len < steps_per_episode:
         a_t, v_t = sess.run([pi, v], feed_dict={s: ob.reshape(1, -1)})
@@ -144,7 +145,6 @@ def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamm
         ob, r_t, done, _ = env.step(a_t[0])
         r_t_buffer.append(r_t)
         ep_len += 1
-        global_step += 1
 
     # Booststrap final state
     if done:
@@ -159,7 +159,7 @@ def a3c_worker(sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamm
     adv_buffer = np.array(r_to_go) - np.array(v_buffer)
 
     return (
-        global_step,
+        ep_len,
         sum(r_t_buffer[:-1]),
         np.asanyarray(r_to_go),
         np.asanyarray(state_buffer),
@@ -204,7 +204,9 @@ def a3c(
             obs_dim = env_g.observation_space.shape
 
             # Shared global params
-            global_step = 0
+            global_step = tf.Variable(
+                name="global_step", initial_value=0, dtype=tf.int32
+            )
             LOG_STD_MAX = 2
             LOG_STD_MIN = -20
 
@@ -284,13 +286,10 @@ def a3c(
             v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr)
             v_grad = v_opt.compute_gradients(loss=v_loss, var_list=var_com + var_v)
 
-            # Local ep_len
-            ep_len = 0
-
             # Logger
             if task_ind == 0:
                 kwargs = setup_logger_kwargs(
-                    exp_name="a3c", seed=0, data_dir="../../data/"
+                    exp_name="a3c", seed=seed, data_dir="../../data/"
                 )
                 logger = EpochLogger(**kwargs)
                 logger.save_config(
@@ -351,12 +350,16 @@ def a3c(
                 )
 
             sess.run(tf.global_variables_initializer())
-            while global_step < max_step:
+
+            global_step_t = sess.run(global_step)
+            while global_step_t < max_step:
                 sess.run(sync_local_params)
 
-                global_step, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
-                    sess, ep_len, env, s, pi, v, global_step, steps_per_episode, gamma
+                ep_len, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
+                    sess, env, s, pi, v, steps_per_episode, gamma
                 )
+                sess.run(tf.assign(global_step, global_step + ep_len))
+                global_step_t = sess.run(global_step)
 
                 _, _, ls_v = sess.run(
                     [v_grad, asyn_v_update, v_loss],
@@ -369,21 +372,23 @@ def a3c(
                 # log in chief node
                 if job_nm == "worker" and task_ind == 0:
                     logger.store(LossV=ls_v, LossPi=ls_pi, EpRet=ep_ret)
-                    if global_step % 200 <= 20:
+                    if global_step_t % 200 <= 50:
                         test(sess, logger)
 
                         # Save model
                         logger.save_state({"env": env})
 
                         # Log diagnostics
-                        logger.log_tabular("TotalEnvInteracts", global_step)
+                        logger.log_tabular("TotalEnvInteracts", global_step_t)
                         logger.log_tabular("LossV", average_only=True)
                         logger.log_tabular("LossPi", average_only=True)
                         logger.log_tabular("EpRet", with_min_and_max=True)
                         logger.log_tabular("TestEpRet", with_min_and_max=True)
                         logger.log_tabular("TestEpLen", average_only=True)
                         logger.dump_tabular()
-            tf.logging.warn("process %d is done" % task_ind)
+            tf.logging.warn(
+                "process {} is done at step {}".format(task_ind, global_step_t)
+            )
 
 
 if __name__ == "__main__":
@@ -391,14 +396,14 @@ if __name__ == "__main__":
         description="arguments for a3c, distributed tensorflow version"
     )
     parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--pi_lr", type=float, default=0.0006)
+    parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
     parser.add_argument("--max_step", type=int, default=1e5)
     parser.add_argument("--steps_per_episode", type=int, default=500)
     parser.add_argument("--hid", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--exp_name", type=str, default="a3c")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--numProc", type=int, default=3)
 
     parser.add_argument("--ps_host", type=str, nargs="+", default=["127.0.0.1:12222"])
