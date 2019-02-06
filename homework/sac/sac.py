@@ -40,27 +40,55 @@ def mlp(x, hid, output_layer, activation, output_activation):
     return tf.layers.dense(input, output_layer, output_activation)
 
 
-def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]):
+class mlp_with_categorical:
     """
-    Actor Critic model:
-    Inputs: observation, reward
-    Outputs: action, logp_pi, logp, v
+    Categorical policy only suitable for discrete actions
     """
-    act_dim = action_space.shape
-    act_lb = action_space.low[0]
-    act_ub = action_space.high[0]
-    with tf.variable_scope("pi"):
 
+    def __init__(self, policy_hid, action_dim):
+        self._hid = policy_hid
+        self._action_dim = action_dim
+
+    def run(self, s, a):
+        logits = mlp(
+            s,
+            self._hid,
+            self._action_dim,
+            activation=tf.nn.tanh,
+            output_activation=None,
+        )
+        logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
+
+        mu = tf.argmax(logp_all, axis=1, output_type=tf.int32)
+
+        # most-likely action
+        pi = tf.squeeze(
+            tf.multinomial(logits, 1, output_dtype=tf.int32), axis=1
+        )  # batch_size x action_index, [n, 1]
+        logp_pi = tf.reduce_sum(
+            tf.one_hot(pi, depth=self._action_dim) * logp_all, axis=1
+        )  # log probability of policy action at current state
+
+        return mu, pi, logp_pi
+
+
+class mlp_with_diagonal_gaussian:
+    def __init__(self, hid, action_dim, act_ub):
+        self._hid = hid
+        self._action_dim = action_dim
+        self._act_ub = act_ub
+
+    def run(self, s, a):
         net = mlp(
             s,
-            policy_hid[:-1],
-            policy_hid[-1],
+            self._hid[:-1],
+            self._hid[-1],
             activation=tf.nn.relu,
             output_activation=tf.nn.relu,
         )
-        mu = tf.layers.dense(net, act_dim[0], activation=None)
+        mu = tf.layers.dense(net, *self._action_dim, activation=None)
         # std dev is dependent on state, instead of a shared-across-states learnable parameters
-        log_std = tf.layers.dense(net, act_dim[0], activation=tf.nn.tanh)
+        log_std = tf.layers.dense(net, *self._action_dim, activation=tf.nn.tanh)
         # Mapping from (-1,1) to (LOG_STD_MIN, LOG_STD_MAX)
         log_std = 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * log_std + 0.5 * (
             LOG_STD_MAX + LOG_STD_MIN
@@ -71,10 +99,32 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
         # log of squashed likelihood, check paper [SAC](https://arxiv.org/pdf/1801.01290.pdf)
         log_pi = log_p_gaussian(pi, mu, log_std) - _squash_correction(pi)
 
-        mu *= act_ub
-        pi *= act_ub
+        mu *= self._act_ub
+        pi *= self._act_ub
+        return mu, pi, log_pi
+
+
+def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]):
+    """
+    Actor Critic model:
+    Inputs: observation, reward
+    Outputs: action, logp_pi, logp, v
+    """
+    with tf.variable_scope("pi"):
+        if isinstance(action_space, gym.spaces.Box):
+            actor = mlp_with_diagonal_gaussian(
+                policy_hid, action_space.shape, action_space.high[0]
+            )
+        elif isinstance(action_space, gym.spaces.Discrete):
+            actor = mlp_with_categorical(policy_hid, action_space.n)
+        else:
+            raise Exception("Unknown action space type")
+
+        mu, pi, log_pi = actor.run(s, a)
 
     # Important: squeeze is very important, it makes sure the q value is with size (batch_size,)
+    if a.dtype == "int32":
+        a = tf.cast(tf.reshape(a, (-1, 1)), tf.float32)
     with tf.variable_scope("q1"):
         q1 = tf.squeeze(
             mlp(
@@ -97,11 +147,14 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
             ),
             axis=1,
         )
+    pi_f = tf.cast(pi, tf.float32)
+    if pi.dtype == "int32":
+        pi_f = tf.cast(tf.reshape(pi, (-1, 1)), tf.float32)
 
     with tf.variable_scope("q1", reuse=True):
         q1_pi = tf.squeeze(
             mlp(
-                tf.concat([s, pi], -1),
+                tf.concat([s, pi_f], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -112,7 +165,7 @@ def actor_critic(s, a, action_space, policy_hid=[64, 64], q_hid=[64], v_hid=[64]
     with tf.variable_scope("q2", reuse=True):
         q2_pi = tf.squeeze(
             mlp(
-                tf.concat([s, pi], -1),
+                tf.concat([s, pi_f], -1),
                 q_hid,
                 1,
                 activation=tf.nn.relu,
@@ -216,18 +269,17 @@ def sac(
     env = env_fn()
     act_space = env.action_space
     act_dim = env.action_space.shape
-    act_ub = act_space.high[0]
-    act_lb = act_space.low[0]
+
     obs_dim = env.observation_space.shape
 
     s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="obs")
     s_next = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="obs_next")
-    a = tf.placeholder(dtype=tf.float32, shape=(None, *act_dim), name="action")
+    if isinstance(act_space, gym.spaces.Box):
+        a = tf.placeholder(dtype=tf.float32, shape=(None, *act_dim), name="action")
+    else:
+        a = tf.placeholder(dtype=tf.int32, shape=(None,), name="action")
     r = tf.placeholder(dtype=tf.float32, shape=None, name="rewards")
     termnt = tf.placeholder(dtype=tf.float32, shape=None)
-
-    # Check continuous action space
-    assert isinstance(env.action_space, gym.spaces.Box)
 
     # Model
     with tf.variable_scope("main"):
@@ -322,6 +374,7 @@ def sac(
             done = False
             while (not done) and step < steps_per_episode:
                 a = sess.run(mu, feed_dict={s: ob.reshape(1, -1)})
+
                 ob, r, done, _ = env.step(a[0])
                 es_ret += r
                 step += 1
@@ -365,6 +418,7 @@ def sac(
                     if done or es_len == steps_per_episode:
                         for i in range(es_len):
                             batch_tuple = buffer.sample(batch_size)
+
                             inputs_minbatch = {
                                 k: v for k, v in zip(all_phs, batch_tuple)
                             }
@@ -439,7 +493,7 @@ def sac(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="arguments for sac")
-    parser.add_argument("--env", type=str, default="Pendulum-v0")
+    parser.add_argument("--env", type=str, default="CartPole-v0")
     parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
     parser.add_argument("--q_lr", type=float, default=0.001)
@@ -453,7 +507,7 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", type=str, default="sac")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rho", type=float, default=0.995)
-    parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--alpha", type=float, default=0.1)
 
     args = parser.parse_args()
 
