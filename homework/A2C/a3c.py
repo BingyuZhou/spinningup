@@ -38,17 +38,15 @@ class mlp_with_categorical:
 
     def run(self, s, a):
         with tf.variable_scope("common"):
-            com = mlp(
-                s,
-                self._hid[:-1],
-                self._hid[-1],
-                activation=tf.nn.tanh,
-                output_activation=tf.tanh,
-            )
+            layer1 = tf.layers.conv2d(s, filters=16, kernel_size=8, strides=3)
+            layer1_re = tf.nn.relu(layer1)
+            layer2 = tf.layers.conv2d(layer1_re, filters=32, kernel_size=4, strides=2)
+            layer2_re = tf.nn.relu(layer2)
+            layer_flat = tf.layers.flatten(layer2_re)
+            com = tf.layers.dense(layer_flat, 256, activation=tf.nn.relu)
+
         with tf.variable_scope("pi"):
-            logits = mlp(
-                com, [], self._action_dim, activation=None, output_activation=None
-            )
+            logits = tf.layers.dense(com, self._action_dim)
             logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
             pi = tf.squeeze(
                 tf.multinomial(logits, 1), axis=1
@@ -111,8 +109,7 @@ def actor_critic(action_space, s, a, common_hid, LOG_STD_MAX, LOG_STD_MIN):
             actor = mlp_with_categorical(common_hid, action_space.n)
         com, pi, logp, logp_pi = actor.run(s, a)
         with tf.variable_scope("v"):
-            v = mlp(com, [], 1, None, None)
-
+            v = tf.layers.dense(com, 1)
     return pi, logp, logp_pi, v
 
 
@@ -137,7 +134,7 @@ def a3c_worker(sess, env, s, pi, v, steps_per_episode, gamma):
     ep_len = 0
 
     while not done and ep_len < steps_per_episode:
-        a_t, v_t = sess.run([pi, v], feed_dict={s: ob.reshape(1, -1)})
+        a_t, v_t = sess.run([pi, v], feed_dict={s: np.expand_dims(ob, 0)})
         state_buffer.append(ob)
         action_buffer.append(a_t[0])
         v_buffer.append(v_t[0][0])
@@ -150,7 +147,7 @@ def a3c_worker(sess, env, s, pi, v, steps_per_episode, gamma):
     if done:
         r_t_buffer.append(0)
     else:
-        r_t_buffer.append(sess.run(v, feed_dict={s: ob.reshape(1, -1)}))
+        r_t_buffer.append(sess.run(v, feed_dict={s: np.expand_dims(ob, 0)}))
 
     # rewards-to-go
     r_to_go = cum_discounted_sum(np.asanyarray(r_t_buffer), gamma)[:-1]
@@ -182,7 +179,7 @@ def a3c(
     worker_host,
     job_nm,
     task_ind,
-    alpha=0.1,
+    alpha=0.01,
 ):
     # Cluster
     cluster = tf.train.ClusterSpec({"ps": ps_host, "worker": worker_host})
@@ -199,6 +196,7 @@ def a3c(
         with tf.device("/job:ps/task:0"):
             # Global Env
             env_g = gym.make(env_name)
+
             act_space = env_g.action_space
             act_dim = env_g.action_space.shape
             obs_dim = env_g.observation_space.shape
@@ -209,6 +207,8 @@ def a3c(
             )
             LOG_STD_MAX = 2
             LOG_STD_MIN = -20
+
+            pi_grad
 
             # Placeholders
             s_g = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
@@ -281,9 +281,9 @@ def a3c(
             v_loss = tf.reduce_mean((v - ret) ** 2)
 
             # Optimizers
-            pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr)
+            pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr, decay=0.99)
             pi_grad = pi_opt.compute_gradients(loss=pi_loss, var_list=var_com + var_pi)
-            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr)
+            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99)
             v_grad = v_opt.compute_gradients(loss=v_loss, var_list=var_com + var_v)
 
             # Logger
@@ -336,7 +336,7 @@ def a3c(
                 ep_ret = 0
                 done = False
                 while (not done) and step < steps_per_episode:
-                    a_t = sess.run(pi, feed_dict={s: ob.reshape(1, -1)})
+                    a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
                     ob, r_t, done, _ = env_g.step(a_t[0])
                     ep_ret += r_t
                     step += 1
@@ -372,7 +372,7 @@ def a3c(
                 # log in chief node
                 if job_nm == "worker" and task_ind == 0:
                     logger.store(LossV=ls_v, LossPi=ls_pi, EpRet=ep_ret)
-                    if global_step_t % 200 <= 50:
+                    if global_step_t % 100 <= 50:
                         test(sess, logger)
 
                         # Save model
@@ -395,11 +395,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="arguments for a3c, distributed tensorflow version"
     )
-    parser.add_argument("--env", type=str, default="CartPole-v1")
+    parser.add_argument("--env", type=str, default="Breakout-v0")
     parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
-    parser.add_argument("--max_step", type=int, default=1e5)
-    parser.add_argument("--steps_per_episode", type=int, default=500)
+    parser.add_argument("--max_step", type=int, default=5e5)
+    parser.add_argument("--steps_per_episode", type=int, default=5)
     parser.add_argument("--hid", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--exp_name", type=str, default="a3c")
@@ -416,7 +416,6 @@ if __name__ == "__main__":
             "127.0.0.1:12224",
             "127.0.0.1:12225",
             "127.0.0.1:12226",
-            "127.0.0.1:12227",
         ],
     )
     parser.add_argument("--job_nm", type=str, default="ps")
