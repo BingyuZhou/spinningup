@@ -208,8 +208,6 @@ def a3c(
             LOG_STD_MAX = 2
             LOG_STD_MIN = -20
 
-            pi_grad
-
             # Placeholders
             s_g = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
             if isinstance(act_space, gym.spaces.Box):
