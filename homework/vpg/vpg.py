@@ -15,14 +15,19 @@ tf.logging.set_verbosity(tf.logging.INFO)
 def log_p_gaussian(x, mu, logstd):
     return tf.reduce_sum(
         -0.5
-        * ((x - mu) ** 2 / (tf.exp(logstd) + EPS) ** 2 + tf.log(2 * np.pi) + 2 * logstd)
+        * (
+            (x - mu) ** 2 / (tf.exp(logstd) + EPS) ** 2 + np.log(2 * np.pi) + 2 * logstd
+        ),
+        axis=1,
     )
 
 
 def mlp(x, hid, output_layer, activation, output_activation):
     input = x
-    for h in hid:
+    for h in hid[:-1]:
         input = tf.layers.dense(input, h, activation)
+    input = tf.layers.dense(input, hid[-1], None)
+
     return tf.layers.dense(input, output_layer, output_activation)
 
 
@@ -43,15 +48,15 @@ class mlp_with_categorical:
             activation=tf.nn.tanh,
             output_activation=None,
         )
-        logp_all = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
+        logp = tf.nn.log_softmax(logits)  # batch_size x action_dim, [n ,m]
         pi = tf.squeeze(
             tf.multinomial(logits, 1), axis=1
         )  # batch_size x action_index, [n, 1]
         logp_pi = tf.reduce_sum(
-            tf.one_hot(pi, depth=self._action_dim) * logp_all, axis=1
+            tf.one_hot(pi, depth=self._action_dim) * logp, axis=1
         )  # log probability of policy action at current state
         logp = tf.reduce_sum(
-            tf.one_hot(a, depth=self._action_dim) * logp_all, axis=1
+            tf.one_hot(a, depth=self._action_dim) * logp, axis=1
         )  # log probability of action a at current state
         return pi, logp, logp_pi
 
@@ -61,7 +66,6 @@ class mlp_with_diagonal_gaussian:
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
 
-    # FIXME: kl divergence too large
     def __init__(self, policy_hid, action_dim):
         self._hid = policy_hid
         self._action_dim = action_dim
@@ -84,13 +88,7 @@ class mlp_with_diagonal_gaussian:
         return pi, logp, logp_pi
 
 
-class mlp_with_diagonal_gaussian_on_state:
-    pass
-
-
-def actor_critic(
-    s, a, action_dim, policy_hid=[64, 64], value_hid=[64], policy_samp="categorical"
-):
+def actor_critic(s, a, action_dim, policy_hid, value_hid, policy_samp):
     """
     Actor Critic model:
     Inputs: observation, reward
@@ -212,36 +210,24 @@ class vpg_buffer:
         mu, stdd = np.mean(self.advantage_buffer), np.std(self.advantage_buffer)
         self.advantage_buffer = (self.advantage_buffer - mu) / stdd
 
-    def sample(self, size):
+    # We should always return the whole buffer, since this is on-policy
+    def get(self):
 
         # Reset
         self.path_start_index = 0
 
-        if size > self.end_index:
-            tf.logging.warn(
-                "sample size is larger or equal than the buffer size, return all buffer"
-            )
-            return [
-                self.state_buffer[: self.end_index + 1],
-                self.action_buffer[: self.end_index + 1],
-                self.rewards_to_go_buffer[: self.end_index + 1],
-                self.logp_buffer[: self.end_index + 1],
-                self.advantage_buffer[: self.end_index + 1],
-            ]
-        else:
-            sample_index = np.random.choice(self.end_index + 1, size, replace=False)
-            return [
-                self.state_buffer[sample_index],
-                self.action_buffer[sample_index],
-                self.rewards_to_go_buffer[sample_index],
-                self.logp_buffer[sample_index],
-                self.advantage_buffer[sample_index],
-            ]
+        return [
+            self.state_buffer[: self.end_index + 1],
+            self.action_buffer[: self.end_index + 1],
+            self.rewards_to_go_buffer[: self.end_index + 1],
+            self.logp_buffer[: self.end_index + 1],
+            self.advantage_buffer[: self.end_index + 1],
+        ]
 
 
 def vpg(
     seed,
-    env,
+    env_fn,
     actor_critic_fn,
     epoch,
     episode,
@@ -252,9 +238,9 @@ def vpg(
     lamb,
     hid,
     buffer_size,
-    batch_size,
     pi_train_itr,
     v_train_itr,
+    logger_kwargs,
 ):
     """
     Vanilla policy gradeint
@@ -263,12 +249,15 @@ def vpg(
     - suitable for discrete and continous action space
     """
     # model saver
-    logger = EpochLogger()
+    logger = EpochLogger(**logger_kwargs)
+
     logger.save_config(locals())
 
     seed += 10000
     tf.set_random_seed(seed)
     np.random.seed(seed)
+
+    env = env_fn()
 
     act_dim = env.action_space.shape
     obs_dim = env.observation_space.shape
@@ -352,20 +341,18 @@ def vpg(
                         es_ret = 0
                         es_len_prev = es_len
             buffer.normalize_adv()
-            batch_tuple_all = buffer.sample(episode * steps_per_episode)
+            batch_tuple = buffer.get()
             pi_loss_old, v_loss_old = sess.run(
                 [pi_loss, v_loss],
                 feed_dict={
-                    s: batch_tuple_all[0],
-                    a: batch_tuple_all[1],
-                    adv: batch_tuple_all[4],
-                    r_to_go: batch_tuple_all[2],
+                    s: batch_tuple[0],
+                    a: batch_tuple[1],
+                    adv: batch_tuple[4],
+                    r_to_go: batch_tuple[2],
                 },
             )
             # Update policy
             for _ in range(pi_train_itr):
-                batch_tuple = buffer.sample(batch_size)
-                assert batch_tuple[0].shape[0] == batch_size
                 sess.run(
                     pi_opt,
                     feed_dict={
@@ -377,17 +364,16 @@ def vpg(
 
             for i in range(v_train_itr):
                 # Update value function
-                batch_tuple = buffer.sample(batch_size)
                 sess.run(v_opt, feed_dict={r_to_go: batch_tuple[2], s: batch_tuple[0]})
 
             pi_loss_new, v_loss_new, approx_kl_v, approx_entropy_v = sess.run(
                 [pi_loss, v_loss, approx_kl, approx_entropy],
                 feed_dict={
-                    s: batch_tuple_all[0],
-                    a: batch_tuple_all[1],
-                    adv: batch_tuple_all[4],
-                    r_to_go: batch_tuple_all[2],
-                    logp_old: batch_tuple_all[3],
+                    s: batch_tuple[0],
+                    a: batch_tuple[1],
+                    adv: batch_tuple[4],
+                    r_to_go: batch_tuple[2],
+                    logp_old: batch_tuple[3],
                 },
             )
 
@@ -423,26 +409,32 @@ def vpg(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="arguments for vpg")
-    parser.add_argument("--env", type=str, default="Pendulum-v0")
-    parser.add_argument("--pi_lr", type=float, default=0.0003)
+    parser.add_argument("--env", type=str, default="Humanoid-v2")
+    parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
-    parser.add_argument("--epoch", type=int, default=50)
+    parser.add_argument("--epoch", type=int, default=500)
     parser.add_argument("--episode", type=int, default=4)
-    parser.add_argument("--steps_per_episode", type=int, default=1000)
-    parser.add_argument("--hid", type=int, nargs="+", default=[64, 64])
+    parser.add_argument("--steps_per_episode", type=int, default=500)
+    parser.add_argument("--hid", type=int, nargs="+", default=[64, 32])
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lamb", type=float, default=0.97)
-    parser.add_argument("--buffer_size", type=int, default=4200)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--pi_train_itr", type=int, default=5)
-    parser.add_argument("--v_train_itr", type=int, default=64)
+    parser.add_argument("--lamb", type=float, default=0.95)
+    parser.add_argument("--buffer_size", type=int, default=2100)
+    parser.add_argument("--pi_train_itr", type=int, default=1)
+    parser.add_argument("--v_train_itr", type=int, default=60)
+    parser.add_argument("--exp_name", type=str, default="vpg")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    env = gym.make(args.env)
+    env_fn = lambda: gym.make(args.env)
+
+    from spinup.utils.run_utils import setup_logger_kwargs
+
+    data_dir = "../data/"
+    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed, data_dir)
 
     vpg(
         0,
-        env,
+        env_fn,
         actor_critic,
         args.epoch,
         args.episode,
@@ -453,8 +445,8 @@ if __name__ == "__main__":
         args.lamb,
         args.hid,
         args.buffer_size,
-        args.batch_size,
         args.pi_train_itr,
         args.v_train_itr,
+        logger_kwargs,
     )
 
