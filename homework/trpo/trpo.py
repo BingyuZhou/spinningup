@@ -70,7 +70,6 @@ class mlp_with_diagonal_gaussian:
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
 
-
     def __init__(self, policy_hid, action_dim):
         self._hid = policy_hid
         self._action_dim = action_dim[0]
@@ -265,7 +264,6 @@ def trpo(
     epoch,
     episode,
     steps_per_episode,
-    pi_lr,
     v_lr,
     gamma,
     lamb,
@@ -524,9 +522,8 @@ def trpo(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="arguments for vpg")
     parser.add_argument("--env", type=str, default="Humanoid-v2")
-    parser.add_argument("--pi_lr", type=float, default=0.0003)
-    parser.add_argument("--v_lr", type=float, default=0.001)
-    parser.add_argument("--epoch", type=int, default=50)
+    parser.add_argument("--v_lr", type=float, default=0.0003)
+    parser.add_argument("--epoch", type=int, default=500)
     parser.add_argument("--episode", type=int, default=4)
     parser.add_argument("--steps_per_episode", type=int, default=500)
     parser.add_argument("--hid", type=int, nargs="+", default=[64, 32])
@@ -559,7 +556,6 @@ if __name__ == "__main__":
         args.epoch,
         args.episode,
         args.steps_per_episode,
-        args.pi_lr,
         args.v_lr,
         args.gamma,
         args.lamb,
