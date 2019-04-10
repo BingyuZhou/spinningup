@@ -1,5 +1,3 @@
-import multiprocessing as mp
-from multiprocessing import Queue, Process, Value
 import tensorflow as tf
 import numpy as np
 from spinup.utils.logx import EpochLogger
@@ -40,7 +38,7 @@ class mlp_with_categorical:
         with tf.variable_scope("common"):
             layer1 = tf.layers.conv2d(s, filters=16, kernel_size=8, strides=3)
             layer1_re = tf.nn.relu(layer1)
-            layer2 = tf.layers.conv2d(layer1_re, filters=32, kernel_size=4, strides=2)
+            layer2 = tf.layers.conv2d(layer1_re, filters=16, kernel_size=4, strides=2)
             layer2_re = tf.nn.relu(layer2)
             layer_flat = tf.layers.flatten(layer2_re)
             com = tf.layers.dense(layer_flat, 256, activation=tf.nn.relu)
@@ -280,9 +278,9 @@ def a3c(
 
             # Optimizers
             pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr, decay=0.99)
-            pi_grad = pi_opt.compute_gradients(loss=pi_loss, var_list=var_com + var_pi)
+            pi_grad = tf.gradients(pi_loss, var_com + var_pi)
             v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99)
-            v_grad = v_opt.compute_gradients(loss=v_loss, var_list=var_com + var_v)
+            v_grad = tf.gradients(v_loss, var_com + var_v)
 
             # Logger
             if task_ind == 0:
@@ -307,13 +305,10 @@ def a3c(
 
         # Asyn update global params
         asyn_pi_update = pi_opt.apply_gradients(
-            [
-                (grad_var_pair[0], var)
-                for grad_var_pair, var in zip(pi_grad, var_com_pi_g)
-            ]
+            [(grad, var) for grad, var in zip(pi_grad, var_com_pi_g)]
         )
         asyn_v_update = v_opt.apply_gradients(
-            [(grad_var_pair[0], var) for grad_var_pair, var in zip(v_grad, var_com_v_g)]
+            [(grad, var) for grad, var in zip(v_grad, var_com_v_g)]
         )
 
         # Sync gloabl params -> local params
@@ -370,7 +365,7 @@ def a3c(
                 # log in chief node
                 if job_nm == "worker" and task_ind == 0:
                     logger.store(LossV=ls_v, LossPi=ls_pi, EpRet=ep_ret)
-                    if global_step_t % 100 <= 50:
+                    if global_step_t % 200 <= 50:
                         test(sess, logger)
 
                         # Save model
@@ -397,7 +392,7 @@ if __name__ == "__main__":
     parser.add_argument("--pi_lr", type=float, default=0.001)
     parser.add_argument("--v_lr", type=float, default=0.001)
     parser.add_argument("--max_step", type=int, default=5e5)
-    parser.add_argument("--steps_per_episode", type=int, default=5)
+    parser.add_argument("--steps_per_episode", type=int, default=20)
     parser.add_argument("--hid", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--exp_name", type=str, default="a3c")
