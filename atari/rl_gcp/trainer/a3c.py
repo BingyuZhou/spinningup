@@ -1,10 +1,8 @@
 import tensorflow as tf
 import numpy as np
-from spinup.utils.logx import EpochLogger
-from spinup.utils.run_utils import setup_logger_kwargs
 import gym
 import argparse
-import scipy
+import scipy.signal
 import os
 import json
 
@@ -287,26 +285,6 @@ def a3c(
             v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99)
             v_grad = tf.gradients(v_loss, var_com + var_v)
 
-            # Logger
-            if task_index == 0:
-                kwargs = setup_logger_kwargs(
-                    exp_name="a3c", seed=seed, data_dir="../../data/"
-                )
-                logger = EpochLogger(**kwargs)
-                logger.save_config(
-                    {
-                        "env": env,
-                        "max_step": max_step,
-                        "steps_per_episode": steps_per_episode,
-                        "pi_lr": pi_lr,
-                        "v_lr": v_lr,
-                        "gamma": gamma,
-                        "alpha": alpha,
-                        "hid": hid,
-                        "cluster": cluster,
-                    }
-                )
-
         # Asyn update global params
         asyn_pi_update = pi_opt.apply_gradients(
             [(grad, var) for grad, var in zip(pi_grad, var_com_pi_g)]
@@ -325,31 +303,31 @@ def a3c(
             ]
         )
 
-        def test(sess, logger, n=10):
+        def test(sess, n=10):
+            ep_ret = 0
             for _ in range(n):
                 step = 0
                 ob = env_g.reset()
                 r_t = 0
-                ep_ret = 0
                 done = False
                 while (not done) and step < steps_per_episode:
                     a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
                     ob, r_t, done, _ = env_g.step(a_t[0])
                     ep_ret += r_t
                     step += 1
-                logger.store(TestEpRet=ep_ret, TestEpLen=step)
+            return ep_ret / n
 
         episode_ret = tf.placeholder(dtype=tf.float32, shape=[], name="episode_ret")
         tf.summary.scalar("ep_ret", episode_ret)
+        test_ep_ret = tf.placeholder(
+            dtype=tf.float32, shape=[], name="test_episode_ret"
+        )
+        tf.summary.scalar("test_ep_ret", test_ep_ret)
 
         merge_tb = tf.summary.merge_all()
 
         # Training in worker
         with tf.Session(server.target) as sess:
-            if job_name == "worker" and task_index == 0:
-                logger.setup_tf_saver(
-                    sess, inputs={"x": s, "a": a}, outputs={"pi": pi, "v": v}
-                )
             writer = tf.summary.FileWriter("./summary/", sess.graph)
 
             sess.run(tf.global_variables_initializer())
@@ -374,23 +352,14 @@ def a3c(
                 )
                 # log in chief node
                 if job_name == "worker" and task_index == 0:
-                    summary = sess.run(merge_tb, feed_dict={episode_ret: ep_ret})
-                    writer.add_summary(summary, global_step=global_step_t)
-                    logger.store(LossV=ls_v, LossPi=ls_pi, EpRet=ep_ret)
+                    test_ret = None
                     if global_step_t % 200 <= 50:
-                        test(sess, logger)
+                        test_ret = test(sess)
 
-                        # Save model
-                        logger.save_state({"env": env})
-
-                        # Log diagnostics
-                        logger.log_tabular("TotalEnvInteracts", global_step_t)
-                        logger.log_tabular("LossV", average_only=True)
-                        logger.log_tabular("LossPi", average_only=True)
-                        logger.log_tabular("EpRet", with_min_and_max=True)
-                        logger.log_tabular("TestEpRet", with_min_and_max=True)
-                        logger.log_tabular("TestEpLen", average_only=True)
-                        logger.dump_tabular()
+                    summary = sess.run(
+                        merge_tb, feed_dict={episode_ret: ep_ret, test_ep_ret: test_ret}
+                    )
+                    writer.add_summary(summary, global_step=global_step_t)
             tf.logging.warn(
                 "process {} is done at step {}".format(task_index, global_step_t)
             )
