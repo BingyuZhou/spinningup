@@ -1,0 +1,25 @@
+trainingInput:
+  scaleTier: STANDARD_1
+  hyperparameters:
+    maxTrials: 40
+    maxParallelTrials: 5
+    enableTrialEarlyStopping: False
+    goal: MAXIMIZE    
+    hyperparameterMetricTag: ep_ret
+    params:
+    - parameterName: pi_lr
+      type: DOUBLE
+      minValue: 0.00001
+      maxValue: 0.001
+      scaleType: UNIT_LOG_SCALE
+    - parameterName: v_lr
+      type: DOUBLE
+      minValue: 0.00001
+      maxValue: 0.001
+      scaleType: UNIT_LOG_SCALE
+    - parameterName: steps_per_episode
+      type: INTEGER
+      minValue: 15
+      maxValue: 100
+      scaleType: UNIT_LOG_SCALE
+    
