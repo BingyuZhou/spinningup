@@ -30,8 +30,7 @@ class mlp_with_categorical:
     Categorical policy only suitable for discrete actions
     """
 
-    def __init__(self, policy_hid, action_dim):
-        self._hid = policy_hid
+    def __init__(self, action_dim):
         self._action_dim = action_dim
         self._rescale = 255.0
 
@@ -68,11 +67,11 @@ class mlp_with_diagonal_gaussian:
     Diagonal Gaussian policy suitable for discrete and continous actions
     """
 
-    def __init__(self, policy_hid, action_dim, LOG_STD_MAX, LOG_STD_MIN):
-        self._hid = policy_hid
+    def __init__(self, action_dim, LOG_STD_MAX, LOG_STD_MIN):
         self._action_dim = action_dim
         self._LOG_STD_MAX = LOG_STD_MAX
         self._LOG_STD_MIN = LOG_STD_MIN
+        self._hid = []
 
     def run(self, s, a):
         with tf.variable_scope("common"):
@@ -99,17 +98,17 @@ class mlp_with_diagonal_gaussian:
 
 
 # Actor-critic
-def actor_critic(action_space, s, a, common_hid, LOG_STD_MAX, LOG_STD_MIN):
+def actor_critic(action_space, s, a, LOG_STD_MAX, LOG_STD_MIN):
 
     with tf.variable_scope("model"):
         if isinstance(action_space, gym.spaces.Box):
             # Continuous action
             actor = mlp_with_diagonal_gaussian(
-                common_hid, action_space.shape, LOG_STD_MAX, LOG_STD_MIN
+                action_space.shape, LOG_STD_MAX, LOG_STD_MIN
             )
         else:
             # Discrete action
-            actor = mlp_with_categorical(common_hid, action_space.n)
+            actor = mlp_with_categorical(action_space.n)
         com, pi, logp, logp_pi = actor.run(s, a)
         with tf.variable_scope("v"):
             v = tf.layers.dense(com, 1)
@@ -169,14 +168,12 @@ def a3c_worker(sess, env, s, pi, v, steps_per_episode, gamma):
 
 
 def a3c(
-    seed,
     env_name,
     max_step,
     steps_per_episode,
     pi_lr,
     v_lr,
     gamma,
-    hid,
     cluster,
     job_name,
     task_index,
@@ -193,49 +190,19 @@ def a3c(
     if job_name == "ps":
         server.join()
     else:
-        # Global graph
-        with tf.device("/job:ps/task:0"):
-            # Global Env
-            env_g = gym.make(env_name)
-
-            act_space = env_g.action_space
-            act_dim = env_g.action_space.shape
-            obs_dim = env_g.observation_space.shape
-
-            # Shared global params
-            global_step = tf.Variable(
-                name="global_step", initial_value=0, dtype=tf.int32
-            )
-            LOG_STD_MAX = 2
-            LOG_STD_MIN = -20
-
-            # Placeholders
-            s_g = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
-            if isinstance(act_space, gym.spaces.Box):
-                a_g = tf.placeholder(dtype=tf.float32, shape=(None, *act_dim), name="a")
-            else:
-                a_g = tf.placeholder(dtype=tf.int32, shape=(None,), name="a")
-
-            # Actor Critic model
-            with tf.variable_scope("global"):
-                pi_g, logp_g, logp_pi_g, v_g = actor_critic(
-                    act_space, s_g, a_g, hid, LOG_STD_MAX, LOG_STD_MIN
-                )
-
-            # Global params
-            var_com_g = tf.trainable_variables(scope="global/model/common")
-            var_pi_g = tf.trainable_variables(scope="global/model/pi")
-            var_v_g = tf.trainable_variables(scope="global/model/v")
-
-            var_com_pi_g = var_com_g + var_pi_g
-            var_com_v_g = var_com_g + var_v_g
-
-        # Local graph
+        # Local graph on worker node
         # Tips: when using tf.train.replica_device_setter(), all the variables (mainly weights of networks)
         # are placed in ps taskes by default. Other operations and states are placed in work_device, which means there is NO local copy of variables!!
-        with tf.device("/job:worker/task:%d" % task_index):
+        with tf.device(tf.train.replica_device_setter(cluster=cluster_spec)):
             # Env
             env = gym.make(env_name)
+
+            act_space = env.action_space
+            act_dim = env.action_space.shape
+            obs_dim = env.observation_space.shape
+
+            LOG_STD_MAX = 2
+            LOG_STD_MIN = -20
 
             # Placeholders
             s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
@@ -249,7 +216,7 @@ def a3c(
 
             # Actor Critic model
             pi, logp, logp_pi, v = actor_critic(
-                act_space, s, a, hid, LOG_STD_MAX, LOG_STD_MIN
+                act_space, s, a, LOG_STD_MAX, LOG_STD_MIN
             )
 
             # Local params
@@ -277,92 +244,85 @@ def a3c(
 
             # Losses with entropy
             pi_loss = -tf.reduce_mean(logp * adv - alpha * logp_pi)
+            tf.summary.scalar("pi_loss", pi_loss)
             v_loss = tf.reduce_mean((v - ret) ** 2)
+            tf.summary.scalar("v_loss", v_loss)
+
+            global_step = tf.train.get_or_create_global_step()
 
             # Optimizers
-            pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr, decay=0.99)
-            pi_grad = tf.gradients(pi_loss, var_com + var_pi)
-            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99)
-            v_grad = tf.gradients(v_loss, var_com + var_v)
+            pi_opt = tf.train.RMSPropOptimizer(
+                learning_rate=pi_lr, decay=0.99
+            ).minimize(loss=pi_loss, global_step=global_step, var_list=var_com + var_pi)
 
-        # Asyn update global params
-        asyn_pi_update = pi_opt.apply_gradients(
-            [(grad, var) for grad, var in zip(pi_grad, var_com_pi_g)]
-        )
-        asyn_v_update = v_opt.apply_gradients(
-            [(grad, var) for grad, var in zip(v_grad, var_com_v_g)]
-        )
-
-        # Sync gloabl params -> local params
-        sync_local_params = tf.group(
-            [
-                tf.assign(v, v_g)
-                for v, v_g in zip(
-                    var_com + var_pi + var_v, var_com_g + var_pi_g + var_v_g
-                )
-            ]
-        )
-
-        def test(sess, n=10):
-            ep_ret = 0
-            for _ in range(n):
-                step = 0
-                ob = env_g.reset()
-                r_t = 0
-                done = False
-                while (not done) and step < steps_per_episode:
-                    a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
-                    ob, r_t, done, _ = env_g.step(a_t[0])
-                    ep_ret += r_t
-                    step += 1
-            return ep_ret / n
-
-        episode_ret = tf.placeholder(dtype=tf.float32, shape=[], name="episode_ret")
-        tf.summary.scalar("ep_ret", episode_ret)
-        test_ep_ret = tf.placeholder(
-            dtype=tf.float32, shape=[], name="test_episode_ret"
-        )
-        tf.summary.scalar("test_ep_ret", test_ep_ret)
-
-        merge_tb = tf.summary.merge_all()
-
-        # Training in worker
-        with tf.Session(server.target) as sess:
-            writer = tf.summary.FileWriter("./summary/", sess.graph)
-
-            sess.run(tf.global_variables_initializer())
-
-            global_step_t = sess.run(global_step)
-            while global_step_t < max_step:
-                sess.run(sync_local_params)
-
-                ep_len, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
-                    sess, env, s, pi, v, steps_per_episode, gamma
-                )
-                sess.run(tf.assign(global_step, global_step + ep_len))
-                global_step_t = sess.run(global_step)
-
-                _, _, ls_v = sess.run(
-                    [v_grad, asyn_v_update, v_loss],
-                    feed_dict={s: state_buffer, a: action_buffer, ret: r_to_go},
-                )
-                _, _, ls_pi = sess.run(
-                    [pi_grad, asyn_pi_update, pi_loss],
-                    feed_dict={s: state_buffer, a: action_buffer, adv: adv_buffer},
-                )
-                # log in chief node
-                if job_name == "worker" and task_index == 0:
-                    test_ret = None
-                    if global_step_t % 200 <= 50:
-                        test_ret = test(sess)
-
-                    summary = sess.run(
-                        merge_tb, feed_dict={episode_ret: ep_ret, test_ep_ret: test_ret}
-                    )
-                    writer.add_summary(summary, global_step=global_step_t)
-            tf.logging.warn(
-                "process {} is done at step {}".format(task_index, global_step_t)
+            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99).minimize(
+                loss=v_loss, global_step=global_step, var_list=var_com + var_v
             )
+
+            def test(sess, n=10):
+                ep_ret = 0
+                for _ in range(n):
+                    step = 0
+                    ob = env.reset()
+                    r_t = 0
+                    done = False
+                    while (not done) and step < steps_per_episode:
+                        a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
+                        ob, r_t, done, _ = env.step(a_t[0])
+                        ep_ret += r_t
+                        step += 1
+                return ep_ret / n
+
+            episode_ret = tf.placeholder(dtype=tf.float32, shape=[], name="episode_ret")
+            tf.summary.scalar("ep_ret", episode_ret)
+            test_ep_ret = tf.placeholder(
+                dtype=tf.float32, shape=[], name="test_episode_ret"
+            )
+            tf.summary.scalar("test_ep_ret", test_ep_ret)
+
+            merge_tb = tf.summary.merge_all()
+
+            # Training in worker
+            with tf.Session(server.target) as sess:
+                writer = tf.summary.FileWriter("./summary/", sess.graph)
+
+                sess.run(tf.global_variables_initializer())
+
+                global_step_t = sess.run(global_step)
+                while global_step_t < max_step:
+                    ep_len, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
+                        sess, env, s, pi, v, steps_per_episode, gamma
+                    )
+                    sess.run(tf.assign(global_step, global_step + ep_len))
+                    global_step_t = sess.run(global_step)
+
+                    _, ls_v = sess.run(
+                        [v_opt, v_loss],
+                        feed_dict={s: state_buffer, a: action_buffer, ret: r_to_go},
+                    )
+                    _, ls_pi = sess.run(
+                        [pi_opt, pi_loss],
+                        feed_dict={s: state_buffer, a: action_buffer, adv: adv_buffer},
+                    )
+                    # log in chief node
+                    if job_name == "master":
+                        test_ret = None
+                        if global_step_t % 200 <= 50:
+                            test_ret = test(sess)
+
+                        summary = sess.run(
+                            merge_tb,
+                            feed_dict={
+                                episode_ret: ep_ret,
+                                test_ep_ret: test_ret,
+                                pi_loss: ls_pi,
+                                v_loss: ls_v,
+                            },
+                        )
+                        writer.add_summary(summary, global_step=global_step_t)
+                tf.logging.warn(
+                    "process {} is done at step {}".format(task_index, global_step_t)
+                )
 
 
 if __name__ == "__main__":
@@ -374,10 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--v_lr", type=float, default=0.001)
     parser.add_argument("--max_step", type=int, default=5e5)
     parser.add_argument("--steps_per_episode", type=int, default=20)
-    parser.add_argument("--hid", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--exp_name", type=str, default="a3c")
-    parser.add_argument("--seed", type=int, default=1)
 
     args = parser.parse_args()
 
@@ -401,14 +358,12 @@ if __name__ == "__main__":
     task_index = tf_config_json.get("task", {}).get("index")
 
     a3c(
-        args.seed,
         args.env,
         args.max_step,
         args.steps_per_episode,
         args.pi_lr,
         args.v_lr,
         args.gamma,
-        args.hid,
         cluster,
         job_name,
         task_index,

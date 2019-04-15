@@ -5,4 +5,6 @@ gcloud ml-engine local train \
     --package-path=$PWD/rl_gcp/trainer \
     --distributed \
     --parameter-server-count=1 \
-    --worker-count=4
+    --worker-count=4 \
+    -- \
+    --max_step=2000
