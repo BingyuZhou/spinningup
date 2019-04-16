@@ -67,15 +67,7 @@ class CustomCommands(setuptools.Command):
 
 #####
 
-REQUIRED_PACKAGES = [
-    "absl_py==0.5.0",
-    "numpy==1.14.2",
-    "gym[atari]==0.10.4",
-    "agents==1.4.0",
-    "keras",
-    "opencv_python==3.4.3.18",
-    "moviepy",
-]
+REQUIRED_PACKAGES = ["numpy", "gym[atari]>=0.10.8", "scipy"]
 
 setup(
     name="rl_on_gcp",

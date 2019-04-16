@@ -224,24 +224,6 @@ def a3c(
             var_pi = tf.trainable_variables(scope="model/pi")
             var_v = tf.trainable_variables(scope="model/v")
 
-            num_com = 0
-            num_pi = 0
-            num_v = 0
-
-            for var in var_com:
-                num_com += np.prod(var.shape)
-            for var in var_pi:
-                num_pi += np.prod(var.shape)
-            for var in var_v:
-                num_v += np.prod(var.shape)
-            num_var = num_v + num_com + num_pi
-
-            tf.logging.info(
-                "overall var {} common {} pi {} v {}".format(
-                    num_var, num_com, num_pi, num_v
-                )
-            )
-
             # Losses with entropy
             pi_loss = -tf.reduce_mean(logp * adv - alpha * logp_pi)
             tf.summary.scalar("pi_loss", pi_loss)
@@ -251,11 +233,11 @@ def a3c(
             global_step = tf.train.get_or_create_global_step()
 
             # Optimizers
-            pi_opt = tf.train.RMSPropOptimizer(
-                learning_rate=pi_lr, decay=0.99
-            ).minimize(loss=pi_loss, global_step=global_step, var_list=var_com + var_pi)
+            pi_opt = tf.train.AdadeltaOptimizer(learning_rate=pi_lr).minimize(
+                loss=pi_loss, global_step=global_step, var_list=var_com + var_pi
+            )
 
-            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr, decay=0.99).minimize(
+            v_opt = tf.train.AdadeltaOptimizer(learning_rate=v_lr).minimize(
                 loss=v_loss, global_step=global_step, var_list=var_com + var_v
             )
 
@@ -307,7 +289,7 @@ def a3c(
                     # log in chief node
                     if job_name == "master":
                         test_ret = None
-                        if global_step_t % 200 <= 50:
+                        if global_step_t % 100 == 0:
                             test_ret = test(sess)
 
                         summary = sess.run(
