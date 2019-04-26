@@ -8,7 +8,7 @@ import json
 
 EPS = 1e-8
 
-tf.logging.set_verbosity(tf.logging.WARN)
+tf.logging.set_verbosity(tf.logging.INFO)
 
 
 def log_p_gaussian(x, mu, logstd):
@@ -189,21 +189,30 @@ def a3c(
     # Global parameters
     if job_name == "ps":
         server.join()
-    else:
+        tf.logging.info("ps stops...")
+    elif job_name == "worker":
+        tf.logging.info("entering worker ...")
+        # Env
+        env = gym.make(env_name)
+
+        act_space = env.action_space
+        act_dim = env.action_space.shape
+        obs_dim = env.observation_space.shape
+
+        LOG_STD_MAX = 2
+        LOG_STD_MIN = -20
+
         # Local graph on worker node
         # Tips: when using tf.train.replica_device_setter(), all the variables (mainly weights of networks)
         # are placed in ps taskes by default. Other operations and states are placed in work_device, which means there is NO local copy of variables!!
-        with tf.device(tf.train.replica_device_setter(cluster=cluster_spec)):
-            # Env
-            env = gym.make(env_name)
-
-            act_space = env.action_space
-            act_dim = env.action_space.shape
-            obs_dim = env.observation_space.shape
-
-            LOG_STD_MAX = 2
-            LOG_STD_MIN = -20
-
+        tf.logging.info(
+            "building model {} task_ind {} ...".format(job_name, task_index)
+        )
+        with tf.device(
+            tf.train.replica_device_setter(
+                worker_device="/job:worker/task:%d" % task_index, cluster=cluster_spec
+            )
+        ):
             # Placeholders
             s = tf.placeholder(dtype=tf.float32, shape=(None, *obs_dim), name="s")
             if isinstance(act_space, gym.spaces.Box):
@@ -233,27 +242,13 @@ def a3c(
             global_step = tf.train.get_or_create_global_step()
 
             # Optimizers
-            pi_opt = tf.train.AdadeltaOptimizer(learning_rate=pi_lr).minimize(
+            pi_opt = tf.train.RMSPropOptimizer(learning_rate=pi_lr).minimize(
                 loss=pi_loss, global_step=global_step, var_list=var_com + var_pi
             )
 
-            v_opt = tf.train.AdadeltaOptimizer(learning_rate=v_lr).minimize(
+            v_opt = tf.train.RMSPropOptimizer(learning_rate=v_lr).minimize(
                 loss=v_loss, global_step=global_step, var_list=var_com + var_v
             )
-
-            def test(sess, n=10):
-                ep_ret = 0
-                for _ in range(n):
-                    step = 0
-                    ob = env.reset()
-                    r_t = 0
-                    done = False
-                    while (not done) and step < steps_per_episode:
-                        a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
-                        ob, r_t, done, _ = env.step(a_t[0])
-                        ep_ret += r_t
-                        step += 1
-                return ep_ret / n
 
             episode_ret = tf.placeholder(dtype=tf.float32, shape=[], name="episode_ret")
             tf.summary.scalar("ep_ret", episode_ret)
@@ -264,47 +259,75 @@ def a3c(
 
             merge_tb = tf.summary.merge_all()
 
-            # Training in worker
-            with tf.Session(server.target) as sess:
-                writer = tf.summary.FileWriter("./summary/", sess.graph)
+            tf.logging.info("finishing model...")
 
-                sess.run(tf.global_variables_initializer())
+        # def test(sess, n=10):
+        #     ep_ret = 0
+        #     for _ in range(n):
+        #         step = 0
+        #         ob = env.reset()
+        #         r_t = 0
+        #         done = False
+        #         while (not done) and step < steps_per_episode:
+        #             a_t = sess.run(pi, feed_dict={s: np.expand_dims(ob, 0)})
+        #             ob, r_t, done, _ = env.step(a_t[0])
+        #             ep_ret += r_t
+        #             step += 1
+        #     return ep_ret / n
 
-                global_step_t = sess.run(global_step)
-                while global_step_t < max_step:
-                    ep_len, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
-                        sess, env, s, pi, v, steps_per_episode, gamma
-                    )
-                    sess.run(tf.assign(global_step, global_step + ep_len))
-                    global_step_t = sess.run(global_step)
+        hooks = [tf.train.StopAtStepHook(last_step=max_step)]
 
-                    _, ls_v = sess.run(
-                        [v_opt, v_loss],
-                        feed_dict={s: state_buffer, a: action_buffer, ret: r_to_go},
-                    )
-                    _, ls_pi = sess.run(
-                        [pi_opt, pi_loss],
-                        feed_dict={s: state_buffer, a: action_buffer, adv: adv_buffer},
-                    )
-                    # log in chief node
-                    if job_name == "master":
-                        test_ret = None
-                        if global_step_t % 100 == 0:
-                            test_ret = test(sess)
+        # Training in worker
+        tf.logging.info("start training...")
+        writer = tf.summary.FileWriter("./summary/")
+        tf.logging.info("summary ...")
 
-                        summary = sess.run(
-                            merge_tb,
-                            feed_dict={
-                                episode_ret: ep_ret,
-                                test_ep_ret: test_ret,
-                                pi_loss: ls_pi,
-                                v_loss: ls_v,
-                            },
-                        )
-                        writer.add_summary(summary, global_step=global_step_t)
-                tf.logging.warn(
-                    "process {} is done at step {}".format(task_index, global_step_t)
+        # with tf.train.MonitoredTrainingSession(
+        #     master=server.target,
+        #     is_chief=(task_index == 0),
+        #     checkpoint_dir="train_logs",
+        #     save_summaries_secs=None,
+        #     save_summaries_steps=None,
+        #     hooks=hooks,
+        # ) as mon_sess:
+        with tf.Session(server.target) as mon_sess:
+            tf.logging.info(
+                "global step {}".format(mon_sess.run(tf.train.get_global_step()))
+            )
+            mon_sess.run(tf.global_variables_initializer())
+            while mon_sess.run(tf.train.get_global_step()) < max_step:
+                ep_len, ep_ret, r_to_go, state_buffer, action_buffer, adv_buffer = a3c_worker(
+                    mon_sess, env, s, pi, v, steps_per_episode, gamma
                 )
+
+                _, ls_v = mon_sess.run(
+                    [v_opt, v_loss],
+                    feed_dict={s: state_buffer, a: action_buffer, ret: r_to_go},
+                )
+                _, ls_pi = mon_sess.run(
+                    [pi_opt, pi_loss],
+                    feed_dict={s: state_buffer, a: action_buffer, adv: adv_buffer},
+                )
+                # log in chief node
+                if task_index == 0:
+                    test_ret = None
+                    # if mon_sess.run(tf.train.get_global_step()) % 100 == 0:
+                    #     test_ret = test(mon_sess)
+
+                    summary = mon_sess.run(
+                        merge_tb,
+                        feed_dict={
+                            episode_ret: ep_ret,
+                            test_ep_ret: test_ret,
+                            pi_loss: ls_pi,
+                            v_loss: ls_v,
+                        },
+                    )
+                    writer.add_summary(
+                        summary, global_step=mon_sess.run(tf.train.get_global_step())
+                    )
+
+        tf.logging.info("training done!")
 
 
 if __name__ == "__main__":

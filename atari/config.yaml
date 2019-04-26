@@ -2,9 +2,9 @@ trainingInput:
   scaleTier: CUSTOM
   masterType: standard_gpu
   workerType: standard_gpu
-  parameterServerType: large_model
+  parameterServerType: standard
   parameterServerCount: 1
-  workerCount: 4
+  workerCount: 2
   hyperparameters:
     maxTrials: 20
     maxParallelTrials: 10
